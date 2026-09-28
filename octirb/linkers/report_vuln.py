@@ -12,8 +12,9 @@ if TYPE_CHECKING:
     from ..client import Client
 
 # Regex to match CVE IDs: CVE-YYYY-NNNNN to CVE-YYYY-NNNNNNN (4-7 digits)
-# Negative lookahead (?!\d) rejects overlong IDs like CVE-2026-123456789
-CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,7}(?!\d)", re.IGNORECASE)
+# Word boundary \b rejects overlong IDs (digit-digit never boundary) and
+# letter continuations like "CVE-2026-1234ABC"
+CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
 
 
 def extract_cves(text: str) -> list[tuple[str, str]]:

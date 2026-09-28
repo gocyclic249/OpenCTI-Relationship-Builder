@@ -48,9 +48,11 @@ ignore = [
 # that module imported inside the test, not at file scope.
 # PLR2004: assertions comparing to a config's documented default value are
 # the point of the test, not an unexplained magic number.
-# F401: imports for interface/type context (e.g., test_report_vuln.py imports
-# CVE_RE to verify the interface, even if not directly tested).
-"tests/*" = ["S101", "S105", "ARG001", "PLC0415", "PLR2004", "F401"]
+# Unused-import ignores are per-file; see below.
+"tests/*" = ["S101", "S105", "ARG001", "PLC0415", "PLR2004"]
+# RULE EXCEPTION: interface-context imports - this file imports CVE_RE, VulnVocabulary
+# etc. to verify interface shape, even when assertions don't directly test them.
+"tests/test_report_vuln.py" = ["F401"]
 # RULE EXCEPTION: test-file-verbatim (Task 7 brief) - this file's content is
 # specified verbatim by the sector-resolver spec, so its lint deviations are
 # accepted here rather than reworded:

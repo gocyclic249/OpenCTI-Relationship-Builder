@@ -10,6 +10,10 @@ def test_extract_rejects_overlong_and_short():
     assert extract_cves("CVE-2026-123 CVE-2026-123456789") == []
 
 
+def test_extract_rejects_letter_continuation():
+    assert extract_cves("CVE-2026-1234ABC and cve-2026-5555xyz") == []
+
+
 def test_evidence_is_context_slice():
     text = "x" * 200 + " exploited via CVE-2026-5555 in the wild " + "y" * 200
     [(cve, quote)] = extract_cves(text)
