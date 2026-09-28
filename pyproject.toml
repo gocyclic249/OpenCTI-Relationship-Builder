@@ -1,0 +1,54 @@
+# octi-rb has no runtime dependencies -- it is Python 3 standard library only.
+# This file exists to pin the lint/type settings so "strictest setting" is
+# reproducible rather than a matter of which flags someone remembered.
+
+[project]
+name = "octi-rb"
+version = "0.1.0"
+description = "Enrich OpenCTI relationships: report containment and actor relationships"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "F", "E", "W",      # pyflakes, pycodestyle
+    "I",                # import sorting
+    "UP",               # pyupgrade
+    "B",                # bugbear
+    "SIM", "FURB",      # simplification / modernisation
+    "C4", "PTH",        # comprehensions, pathlib
+    "ARG",              # unused arguments
+    "TRY",              # exception antipatterns
+    "S",                # bandit security
+    "PL",               # pylint
+    "RUF",
+]
+ignore = [
+    # The GraphQL queries are readable as written; splitting them to satisfy
+    # line length would hurt more than it helps.
+    "E501",
+    # TRY003: the error strings here are one-offs aimed at a human at a
+    # terminal, not a caught-and-matched exception hierarchy.
+    "TRY003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# S101: the CLI's argparse wiring is the one place a plain assert reads better
+# than a raise, and it is never run under -O.
+"octirb/cli.py" = []
+# S101: pytest's whole idiom is the bare assert, and tests never run under -O.
+"tests/*" = ["S101"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+disallow_any_generics = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
