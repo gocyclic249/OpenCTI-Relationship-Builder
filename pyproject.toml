@@ -41,7 +41,14 @@ ignore = [
 # than a raise, and it is never run under -O.
 "octirb/cli.py" = []
 # S101: pytest's whole idiom is the bare assert, and tests never run under -O.
-"tests/*" = ["S101"]
+# S105: literal tokens like "tok-1" in tests are fixtures, not real secrets.
+# ARG001: fixtures such as `capsys` are requested for their side effect
+# (patching stdout/stderr capture) even when the test never reads them back.
+# PLC0415: monkeypatching a module's own attribute (e.g. `c.shutil`) needs
+# that module imported inside the test, not at file scope.
+# PLR2004: assertions comparing to a config's documented default value are
+# the point of the test, not an unexplained magic number.
+"tests/*" = ["S101", "S105", "ARG001", "PLC0415", "PLR2004"]
 
 [tool.mypy]
 python_version = "3.11"
