@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 
 from octirb import cli, ledger
+from octirb.client import OpenCTIError
 from octirb.config import Config, RunsCfg
 from octirb.linkers import REGISTRY
 from octirb.linkers.base import Linker
@@ -88,6 +89,20 @@ def test_main_leaves_argparse_exits_alone() -> None:
 def test_main_returns_int_exit_code_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(cli.COMMANDS, "status", lambda _args: cli.EXIT_FAIL)
     assert cli.main(["status"]) == cli.EXIT_FAIL
+
+
+def test_main_catches_opencti_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def boom(_args: Namespace) -> int:
+        raise OpenCTIError("platform unreachable at http://localhost:8080")
+
+    monkeypatch.setitem(cli.COMMANDS, "status", boom)
+    result = cli.main(["status"])
+    assert result == cli.EXIT_FAIL
+    err = capsys.readouterr().err
+    assert "platform unreachable at http://localhost:8080" in err
+    assert "Traceback" not in err
 
 
 # -------------------------------------------------------------------- select
@@ -358,6 +373,78 @@ def test_revert_rejects_corrupt_applied_ledger(tmp_path: Path, monkeypatch: pyte
     monkeypatch.setattr(cli, "_load_cfg", lambda _args: cfg)
     result = cli.cmd_revert(ns(run_id="r1"))
     assert result == cli.EXIT_BAD_RUN
+
+
+class MixedRevertFakeClient:
+    """One ledger of every kind at once: proves each revert helper only acts
+    on its own kind. Before the fix, _revert_relationships handed writer.revert
+    (which never filters by kind) the WHOLE row list, and writer.revert
+    KeyErrors on the first non-relationship row's missing "preexisted" key."""
+
+    def __init__(self) -> None:
+        self.removed_objects: list[tuple[str, str]] = []
+        self.removed_aliases: list[tuple[str, str]] = []
+        self.deleted_relationships: list[str] = []
+        self.deleted_actors: list[tuple[str, str]] = []
+
+    def remove_object_from_report(self, report_id: str, object_id: str) -> None:
+        self.removed_objects.append((report_id, object_id))
+
+    def remove_label_from_report(self, report_id: str, label_id: str) -> None:
+        raise AssertionError("no containment row in this test carries a label_id")
+
+    def remove_entity_alias(self, entity_id: str, alias: str) -> None:
+        self.removed_aliases.append((entity_id, alias))
+
+    def relationship_state(self, rel_id: str) -> tuple[bool, list[str]]:
+        return (True, ["AI-Relationship"])
+
+    def delete_relationship(self, rel_id: str) -> None:
+        self.deleted_relationships.append(rel_id)
+
+    def entity_labels(self, entity_id: str) -> list[str]:
+        return ["AI-Location"]
+
+    def entity_reference_counts(self, entity_id: str) -> tuple[int, int]:
+        return (0, 0)
+
+    def delete_actor(self, entity_type: str, entity_id: str) -> None:
+        self.deleted_actors.append((entity_type, entity_id))
+
+
+def test_revert_filters_rows_by_kind(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_dir = tmp_path / "r1"
+    write_meta(run_dir, linker="report-location")
+    containment = ledger.containment_row(
+        report_id="r1", entity_id="e1", entity_name="France", linker="report-location",
+        key="FRA", role="target", confidence="high", evidence="q", label_id=None, created=False,
+    )
+    alias = ledger.alias_row(
+        entity_id="e2", entity_name="APT29", alias="ICE RELIC", preexisted=False, evidence="q"
+    )
+    rel_item = {
+        "actor_id": "a1", "actor": "APT29", "relationship_type": "targets",
+        "target_kind": "country", "target_id": "t1", "target_name": "Ukraine",
+        "confidence": "high", "evidence": "q", "source": "report", "source_refs": ["r1"],
+    }
+    relationship = ledger.relationship_row(
+        rel_item, relationship_id="rel-1", preexisted=False, in_reports=[], label_id="lbl-2",
+        status="created",
+    )
+    entity = ledger.entity_row(entity_id="e3", entity_type="Intrusion-Set", name="WaterPlum")
+    (run_dir / "applied.json").write_text(json.dumps([containment, alias, relationship, entity]))
+
+    cfg = make_cfg(tmp_path)
+    monkeypatch.setattr(cli, "_load_cfg", lambda _args: cfg)
+    fake = MixedRevertFakeClient()
+    monkeypatch.setattr(cli, "_client", lambda _cfg: fake)
+
+    result = cli.cmd_revert(ns(run_id="r1"))
+    assert result == cli.EXIT_OK
+    assert fake.removed_objects == [("r1", "e1")]
+    assert fake.removed_aliases == [("e2", "ICE RELIC")]
+    assert fake.deleted_relationships == ["rel-1"]
+    assert fake.deleted_actors == [("Intrusion-Set", "e3")]
 
 
 # ------------------------------------------------------------------- status

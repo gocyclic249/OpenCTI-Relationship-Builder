@@ -83,12 +83,12 @@ def _select_write(client: Client, cfg: Config, run: Run, args: Namespace) -> int
 
 def cmd_select(args: Namespace) -> int:
     get(args.linker)  # unknown linker -> SystemExit before anything else
-    if args.linker == "report-vuln" and not _load_cfg(args).vulns.enabled:
+    cfg = _load_cfg(args)
+    if args.linker == "report-vuln" and not cfg.vulns.enabled:
         raise SystemExit("config: report-vuln is disabled ([vulns].enabled)")
     if args.linker == "actor-target" and args.source not in ("description", "report"):
         _log("select --linker actor-target requires --source description|report")
         return EXIT_BAD_RUN
-    cfg = _load_cfg(args)
     runs_dir = cfg.runs_dir
     if args.run_id and (runs_dir / args.run_id / META).is_file():
         _log(f"run {args.run_id} already exists in {runs_dir} — choose a new --run-id or omit it")
@@ -353,11 +353,16 @@ def cmd_apply(args: Namespace) -> int:
 def _revert_relationships(
     args: Namespace, cfg: Config, client: Client, rows: list[JsonDict]
 ) -> tuple[int, int]:
-    if not any(r.get("kind") == "relationship" for r in rows):
+    """writer.revert (unlike pipeline.revert_containment/revert_aliases) does not
+    filter by kind itself -- it indexes row["preexisted"]/row["relationship_id"]
+    on every row it is given, which KeyErrors on a containment/alias/entity row.
+    Filter to this kind before calling it."""
+    relationship_rows = [r for r in rows if r.get("kind") == "relationship"]
+    if not relationship_rows:
         return (0, 0)
     label = cfg.label("Relationship")
     ctx = writer.ApplyContext(label_id="", label=label, ours={}, dry_run=args.dry_run, log=_log)
-    return writer.revert(client, rows, ctx)
+    return writer.revert(client, relationship_rows, ctx)
 
 
 def _revert_entities(
@@ -635,11 +640,18 @@ def main(argv: list[str] | None = None) -> int:
     for a bad run/config state, which Python would otherwise print and exit 1,
     discarding EXIT_BAD_RUN. Catching it here and remapping is what makes that
     contract real. Dispatch goes through COMMANDS (not args.func) so a test can
-    monkeypatch COMMANDS and have main() see the replacement.
+    monkeypatch COMMANDS and have main() see the replacement. `client.py` raises
+    `OpenCTIError` for any unreachable-platform/bad-response condition -- reachable
+    from every command outside doctor's own local catch -- so it is mapped to a
+    one-line stderr message and EXIT_FAIL here rather than left to crash with a
+    traceback and an incidental exit(1).
     """
     args = build_parser().parse_args(argv)
     try:
         result: int = COMMANDS[args.command](args)
+    except OpenCTIError as exc:
+        _log(f"OpenCTI error: {exc}")
+        return EXIT_FAIL
     except SystemExit as exc:
         if exc.code is None or isinstance(exc.code, int):
             raise

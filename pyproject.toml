@@ -72,6 +72,13 @@ ignore = [
 # fake reads as documentation of what materialize_text calls; the fake never
 # needs most of those arguments' values.
 "tests/test_pipeline_select.py" = ["PLR0913", "ARG002"]
+# ARG002: MixedRevertFakeClient's methods mirror WriterClient/Client's real
+# signatures (remove_label_from_report, relationship_state, entity_labels,
+# entity_reference_counts) so the fake reads as documentation of what
+# cmd_revert's helpers call; several args are unused because this test's
+# rows never exercise that branch (e.g. no containment row carries a
+# label_id).
+"tests/test_cli.py" = ["ARG002"]
 
 [tool.mypy]
 python_version = "3.11"
