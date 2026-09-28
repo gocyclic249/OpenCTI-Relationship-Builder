@@ -160,3 +160,13 @@ def test_three_row_fixture_covers_each_action():
     assert kinds.count("relabel-relationship") == 1
     assert {"action": "relabel-relationship", "relationship_id": "relA",
             "add": "AI-Relationship", "remove": "octi-rel"} in plan
+
+
+def test_pre_split_row_without_dimension_is_location():
+    """Rows older than the dimension split have country_id and no dimension."""
+    rows = [{"report_id": "r1", "country_id": "c1", "country_name": "France"}]
+    plan = migrate.plan_migrations([rows], [])
+    assert plan == [
+        {"action": "relabel-report", "report_id": "r1",
+         "add": "AI-Location", "remove": "octi-geo"}
+    ]

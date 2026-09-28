@@ -104,7 +104,13 @@ _TARGET_FIELD: dict[str, str] = {
 def _geo_row_actions(row: JsonDict) -> list[JsonDict]:
     """The relabel-report action (always) and relabel-entity action (only
     when the row minted an entity) implied by one octi-geo ledger row."""
+    # Rows written before octi-geo's dimension split carry no "dimension" key
+    # at all (they used country_id/country_name). Only location rows predate
+    # the split, so a missing key means "location" — never a guess for any
+    # other value, which still hard-fails below.
     dimension = row.get("dimension")
+    if dimension is None and (row.get("country_id") or row.get("iso3") or row.get("key")):
+        dimension = "location"
     if dimension not in GEO_REPORT_LABELS:
         raise ValueError(f"plan_migrations: unknown octi-geo dimension {dimension!r}")
     add, remove = GEO_REPORT_LABELS[str(dimension)]
