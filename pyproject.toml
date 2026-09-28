@@ -64,6 +64,14 @@ ignore = [
 #   subs, parents, aliases) -- one parameter per field reads clearer split up.
 # RUF005: `FILIGRAN + [...]` builds a per-test fixture list, not a hot path.
 "tests/test_sectors.py" = ["F401", "ARG002", "PLR0913", "PLR0917", "RUF005"]
+# report_node() mirrors a REPORTS_Q node's shape (id, name, source, desc_len,
+# host, published, import_files, has_objects) -- one parameter per field
+# reads clearer split up, same rationale as test_sectors.py's node() above.
+# FetchFake's methods mirror Client's real method signatures (connector_id,
+# external_reference_files, ask_enrichment, wait_for_file, download) so the
+# fake reads as documentation of what materialize_text calls; the fake never
+# needs most of those arguments' values.
+"tests/test_pipeline_select.py" = ["PLR0913", "ARG002"]
 
 [tool.mypy]
 python_version = "3.11"
