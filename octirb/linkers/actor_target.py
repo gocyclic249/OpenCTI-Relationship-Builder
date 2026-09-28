@@ -330,7 +330,13 @@ EXTRA_TRAPS = {
     ),
     "report": (
         "  - The reporting vendor (Mandiant, GTIG, Kaspersky, CISA ...) is not an actor.\n"
-        "  - An actor mentioned only in passing yields no relationships."
+        "  - An actor mentioned only in passing yields no relationships.\n"
+        "  - A report names several actors, so evidence must carry BOTH quotes from\n"
+        "    the same passage, joined \" | \": the quote naming the actor, then the\n"
+        "    quote naming the target, e.g.\n"
+        "    \"APT29 has been attributed to the SVR | targeting ministries in Ukraine\".\n"
+        "    Both halves must be about the same actor. If the target sentence is\n"
+        "    about a different actor than the one named, emit nothing for it."
     ),
 }
 

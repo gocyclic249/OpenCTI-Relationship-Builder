@@ -5,7 +5,11 @@ description: Work a run's review.json queue after `validate` — promote, drop, 
 
 # octi-review
 
-Works a run's `review.json` after `bin/octi-rb validate` has split
+> **Paths.** Commands use `${CLAUDE_PLUGIN_ROOT}/bin/octi-rb` — Claude Code sets
+> `CLAUDE_PLUGIN_ROOT` for plugin skills. From a repo clone, run `bin/octi-rb`
+> from the repository root instead.
+
+Works a run's `review.json` after `${CLAUDE_PLUGIN_ROOT}/bin/octi-rb validate` has split
 `extractions.json` into `auto.json` (writes automatically) and
 `review.json` (needs a human look). This is what makes `apply
 --include-review` safe to run afterward — never run `--include-review`
@@ -32,6 +36,21 @@ Everything with `hard_fail: false` is a judgement call the tool declined to
 make automatically — usually because `confidence` is `medium`/`low`, or the
 match came from the crosswalk. These are the ones worth reading carefully.
 
+## Dropping an item
+
+`--include-review` writes **every** non-`hard_fail` item in `review.json`,
+so leaving an item there does not reject it — it will be applied. To drop
+an item, remove it before `apply --include-review`, one of two ways:
+
+- **Durable:** delete (or correct) its entry in `extractions.json`, then
+  re-run `validate`. Use this whenever you may re-validate later.
+- **Quick:** delete its row from `review.json` *after* your last
+  `validate`. `validate` regenerates `review.json` from
+  `extractions.json`, so this edit is lost if you re-validate.
+
+The same applies to an unwanted `auto.json` item: `apply` writes all of
+`auto.json`, so fix it in `extractions.json` and re-validate.
+
 ## Checklist
 
 1. **Read `review.json`** for the run (and `CONTRACT.md` / the original
@@ -43,19 +62,18 @@ match came from the crosswalk. These are the ones worth reading carefully.
      typo, add the missing evidence quote, fix an enum value) and re-run:
 
      ```
-     bin/octi-rb validate
+     ${CLAUDE_PLUGIN_ROOT}/bin/octi-rb validate
      ```
 
      to move it into `auto.json`, or include it via
-     `bin/octi-rb apply --dry-run --include-review` /
-     `bin/octi-rb apply --include-review` once you've confirmed it's
+     `${CLAUDE_PLUGIN_ROOT}/bin/octi-rb apply --dry-run --include-review` /
+     `${CLAUDE_PLUGIN_ROOT}/bin/octi-rb apply --include-review` once you've confirmed it's
      genuinely correct (never for a `hard_fail: true` item — fix the root
      cause instead, per above).
 
-   - **Drop it.** Leave it in `review.json` (or note it as rejected) if the
-     evidence doesn't actually support the extraction. Nothing further
-     needs to happen — items left in `review.json` are never applied unless
-     explicitly promoted.
+   - **Drop it**, if the evidence doesn't actually support the extraction.
+     This takes an edit — see "Dropping an item" below. Leaving it in
+     `review.json` does **not** drop it.
 
    - **Fix the root cause**, when the same defect recurs across items (see
      below) — this is usually the higher-leverage fix over promoting items
@@ -73,7 +91,7 @@ match came from the crosswalk. These are the ones worth reading carefully.
    ```
 
    Before proposing it, confirm the target name is actually canonical on
-   this platform (`bin/octi-rb doctor` reports `[sectors].aliases
+   this platform (`${CLAUDE_PLUGIN_ROOT}/bin/octi-rb doctor` reports `[sectors].aliases
    target(s) not canonical` if it isn't — see `octi-setup`), and that the
    two names really are duplicates of the same real-world sector, not two
    different things that happen to sound similar.
@@ -87,7 +105,7 @@ match came from the crosswalk. These are the ones worth reading carefully.
    as the same adversary as the resolved platform entity before promoting
    it; the crosswalk is a large, community-maintained set and is not
    infallible. If the equivalence doesn't hold for this article, drop the
-   item rather than promote it.
+   item (see "Dropping an item") rather than promote it.
 
 5. **Alias write-back proposals → verify the article states the
    equivalence.** `report-actor` items (with `[actors].alias_writeback =
@@ -106,11 +124,14 @@ match came from the crosswalk. These are the ones worth reading carefully.
    with a **dry-run before applying for real**:
 
    ```
-   bin/octi-rb validate
-   bin/octi-rb apply --dry-run --include-review
-   bin/octi-rb apply --include-review
+   ${CLAUDE_PLUGIN_ROOT}/bin/octi-rb validate
+   ${CLAUDE_PLUGIN_ROOT}/bin/octi-rb apply --dry-run --include-review
+   ${CLAUDE_PLUGIN_ROOT}/bin/octi-rb apply --include-review
    ```
 
    Read the dry-run output before the real apply — it runs the identical
    decision pass with zero platform writes, so it's the last chance to
-   catch a promotion you didn't mean to make.
+   catch a promotion you didn't mean to make. Every non-`hard_fail` row
+   still in `review.json` at this point **will be written**: if the dry run
+   lists an item you meant to drop, remove it first (see "Dropping an
+   item").

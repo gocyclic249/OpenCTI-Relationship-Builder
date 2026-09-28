@@ -355,3 +355,12 @@ def test_select_report_rejects_bad_inputs(tmp_path: Path):
         select_report(FakeReportClient({}), cache, "not-a-config", None)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="positive"):
         select_report(FakeReportClient({}), cache, Config(), 0)
+
+
+def test_report_contract_requires_pair_evidence():
+    """I7: spec -- each report-source pair carries both quotes from the same
+    passage. The description source has one actor per packet and doesn't."""
+    report = render("report", SECTORS, REGIONS)
+    assert "BOTH quotes" in report
+    assert '" | "' in report
+    assert "BOTH quotes" not in render("description", SECTORS, REGIONS)

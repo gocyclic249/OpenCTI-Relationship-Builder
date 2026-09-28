@@ -5,26 +5,30 @@ description: Build actor -> target (origin/targets) relationships from an actor'
 
 # octi-link-actors
 
+> **Paths.** Commands use `${CLAUDE_PLUGIN_ROOT}/bin/octi-rb` — Claude Code sets
+> `CLAUDE_PLUGIN_ROOT` for plugin skills. From a repo clone, run `bin/octi-rb`
+> from the repository root instead.
+
 Runs the `actor-target` linker: it builds `origin` (an Intrusion-Set's
 `originates-from` / a Threat-Actor-Group's `located-at`) and `targets`
 relationships from either an actor's own platform description, or from
 report text already in the shared cache. Unlike the `report-*` linkers this
 one writes **relationships**, not containment, and has no `fetch` step of
-its own. Run `octi-setup` first if `bin/octi-rb doctor` isn't clean.
+its own. Run `octi-setup` first if `${CLAUDE_PLUGIN_ROOT}/bin/octi-rb doctor` isn't clean.
 
 ## Checklist
 
 1. **Select a source and a batch of actors:**
 
    ```
-   bin/octi-rb select --linker actor-target --source description
+   ${CLAUDE_PLUGIN_ROOT}/bin/octi-rb select --linker actor-target --source description
    ```
 
    or, once `report-*` linker runs have populated the text cache with
    article text and actor refs for reports:
 
    ```
-   bin/octi-rb select --linker actor-target --source report
+   ${CLAUDE_PLUGIN_ROOT}/bin/octi-rb select --linker actor-target --source report
    ```
 
    `--source` is required for this linker — `select` refuses with a usage
@@ -40,7 +44,7 @@ its own. Run `octi-setup` first if `bin/octi-rb doctor` isn't clean.
    for whichever `--source` this run used):
 
    ```
-   bin/octi-rb batch
+   ${CLAUDE_PLUGIN_ROOT}/bin/octi-rb batch
    ```
 
 3. **Extract with Claude** — read `batch.json` against `CONTRACT.md` and
@@ -52,14 +56,14 @@ its own. Run `octi-setup` first if `bin/octi-rb doctor` isn't clean.
    `review.json`:
 
    ```
-   bin/octi-rb validate
+   ${CLAUDE_PLUGIN_ROOT}/bin/octi-rb validate
    ```
 
 5. **Dry-run, then apply:**
 
    ```
-   bin/octi-rb apply --dry-run
-   bin/octi-rb apply
+   ${CLAUDE_PLUGIN_ROOT}/bin/octi-rb apply --dry-run
+   ${CLAUDE_PLUGIN_ROOT}/bin/octi-rb apply
    ```
 
    `actor-target` writes relationships (upsert semantics — pre-existence is
@@ -68,22 +72,30 @@ its own. Run `octi-setup` first if `bin/octi-rb doctor` isn't clean.
 
 6. **Before any `apply --include-review`: read every review item's evidence
    pair-by-pair.** A `targets`/`origin` candidate only belongs in
-   auto-apply territory when both halves of its evidence are genuinely
-   about the *same* actor — a relationship inferred by juxtaposing two
+   auto-apply territory when its evidence (for `--source report`, both
+   halves of it) is genuinely about the *same* actor — a relationship inferred by juxtaposing two
    separate quotes about two different actors is not a real relationship.
    For each review item you're considering promoting:
    - Read the `evidence` quote and confirm it is actually about the actor
      named in `actor`/`actor_id` for that item, not a neighboring actor
      mentioned nearby in the same packet.
+   - With `--source report`, `evidence` carries two quotes joined `" | "`:
+     the actor half, then the target half. The two halves must be about the
+     same actor — if the target half is about a different actor than the
+     actor half names, the pair is false.
    - If the article's evidence conflates two actors, or the quote is
      actually about a *different* actor than the one the candidate claims,
-     **drop the item** — do not include it in the promoted set. Collect
-     everything you drop into a `dropped.json` file in the run directory
-     (report_id/actor_id/target plus a one-line reason), so the decision is
-     auditable later.
-   - Only after this pass, run `apply --include-review` to promote the
-     items that survived (this still never promotes anything with
-     `hard_fail: true` — see `octi-review` for that distinction).
+     **drop the item**. `--include-review` writes every non-`hard_fail`
+     item left in `review.json`, so dropping means removing it: delete its
+     entry from `extractions.json` and re-run `validate` (durable), or
+     delete its row from `review.json` after your last `validate` (lost if
+     you re-validate). Also record each drop in a `dropped.json` file in
+     the run directory (report_id/actor_id/target plus a one-line reason)
+     — that file is an audit log only; it stops nothing from being applied.
+   - Only after this pass, run `apply --dry-run --include-review`, confirm
+     none of your dropped items appear, then `apply --include-review` (this
+     still never promotes anything with `hard_fail: true` — see
+     `octi-review` for that distinction).
 
 ## Judgement rules (embedded from the actor_target contract)
 
@@ -116,7 +128,11 @@ These are the exact rules rendered into `CONTRACT.md` for this linker.
   to other groups' pages are not statements about this actor.
 - With `--source report`: the reporting vendor (Mandiant, GTIG, Kaspersky,
   CISA, ...) is not an actor; an actor mentioned only in passing yields no
-  relationships.
+  relationships. A report names several actors, so `evidence` must carry
+  **both** quotes from the same passage, joined `" | "` — the quote naming
+  the actor, then the quote naming the target. The two halves must be about
+  the same actor; if the target sentence is about a different actor, emit
+  nothing for it.
 - evidence must be a real quote from the packet, not a paraphrase.
 - confidence "high" only when the text states it plainly — anything
   inferred, hedged or ambiguous is "medium" or "low", and goes to review.

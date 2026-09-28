@@ -5,9 +5,13 @@ description: Run one report-* linker pass (report-location, report-sector, repor
 
 # octi-link-reports
 
+> **Paths.** Commands use `${CLAUDE_PLUGIN_ROOT}/bin/octi-rb` — Claude Code sets
+> `CLAUDE_PLUGIN_ROOT` for plugin skills. From a repo clone, run `bin/octi-rb`
+> from the repository root instead.
+
 Runs one of the four report-scoped linkers — `report-location`,
 `report-sector`, `report-actor`, `report-vuln` — through the full pipeline
-for one run. Run `octi-setup` first if `bin/octi-rb doctor` isn't clean.
+for one run. Run `octi-setup` first if `${CLAUDE_PLUGIN_ROOT}/bin/octi-rb doctor` isn't clean.
 Every command below accepts `--run-id`; omit it once you have a run open and
 every later command defaults to the most recently created run.
 
@@ -16,13 +20,16 @@ every later command defaults to the most recently created run.
 1. **Pick a linker and select a batch of reports:**
 
    ```
-   bin/octi-rb select --linker report-location --limit 25
+   ${CLAUDE_PLUGIN_ROOT}/bin/octi-rb select --linker report-location --limit 25
    ```
 
    (substitute `report-sector`, `report-actor`, or `report-vuln`). The
-   default only selects reports that don't already carry this linker's
-   containment (`objects` is empty for it). Add `--all-reports` on a
-   second-or-later pass over the same corpus to clear that filter. Other
+   default skips any report that already contains **any** objects — of any
+   type, not just this linker's — so after one linker has enriched a batch,
+   the default `select` for a second linker skips those same reports. Use
+   `--all-reports` for a second linker pass over the same corpus (objects
+   already on a report are recorded `preexisted: true` and left alone by
+   `revert`). Other
    useful flags: `--since-days N` (override `[selection].since_days`),
    `--limit N`. Note the printed `run <id> [...]: N item(s) selected` —
    that's your `--run-id` for the rest of this pass if you need to name it
@@ -33,13 +40,13 @@ every later command defaults to the most recently created run.
    step):
 
    ```
-   bin/octi-rb fetch
+   ${CLAUDE_PLUGIN_ROOT}/bin/octi-rb fetch
    ```
 
 3. **Batch:**
 
    ```
-   bin/octi-rb batch
+   ${CLAUDE_PLUGIN_ROOT}/bin/octi-rb batch
    ```
 
    For `report-location`, `report-sector`, and `report-actor` this writes
@@ -65,7 +72,7 @@ every later command defaults to the most recently created run.
       to that, not overwrite it:
 
       ```
-      bin/octi-rb structured
+      ${CLAUDE_PLUGIN_ROOT}/bin/octi-rb structured
       ```
 
    b. **Extract with Claude** — this is the one step that isn't a CLI
@@ -79,19 +86,19 @@ every later command defaults to the most recently created run.
    automatically) and `review.json` (needs a human look):
 
    ```
-   bin/octi-rb validate
+   ${CLAUDE_PLUGIN_ROOT}/bin/octi-rb validate
    ```
 
 6. **Dry-run, read the output, then apply:**
 
    ```
-   bin/octi-rb apply --dry-run
+   ${CLAUDE_PLUGIN_ROOT}/bin/octi-rb apply --dry-run
    ```
 
    Read what it says it would write. Then:
 
    ```
-   bin/octi-rb apply
+   ${CLAUDE_PLUGIN_ROOT}/bin/octi-rb apply
    ```
 
    Add `--include-review` to also apply non-`hard_fail` review items once

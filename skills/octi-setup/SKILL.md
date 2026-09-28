@@ -1,20 +1,25 @@
 ---
 name: octi-setup
-description: Configure and health-check octi-rb against an OpenCTI platform — copy config.example.toml, set the platform URL and API token, run `bin/octi-rb doctor`, and walk every finding to its fix until doctor is clean. Trigger on "octi setup", "set up octi-rb", "configure OpenCTI Relationship Builder", "enrich OpenCTI", "run doctor", or "octi-rb doctor is failing".
+description: Configure and health-check octi-rb against an OpenCTI platform — copy config.example.toml, set the platform URL and API token, run `octi-rb doctor`, and walk every finding to its fix until doctor is clean. Trigger on "octi setup", "set up octi-rb", "configure OpenCTI Relationship Builder", "enrich OpenCTI", "run doctor", or "octi-rb doctor is failing".
 ---
 
 # octi-setup
 
-Gets a fresh checkout of `octi-rb` from zero to a clean `bin/octi-rb doctor`
+> **Paths.** Commands use `${CLAUDE_PLUGIN_ROOT}/bin/octi-rb` — Claude Code sets
+> `CLAUDE_PLUGIN_ROOT` for plugin skills. From a repo clone, run `bin/octi-rb`
+> from the repository root instead.
+
+Gets a fresh checkout of `octi-rb` from zero to a clean `${CLAUDE_PLUGIN_ROOT}/bin/octi-rb doctor`
 run. Do this once per OpenCTI platform (or per `config.toml` you keep) before
-running any of the other skills. Run every command from the repository root.
+running any of the other skills. Run every command from the directory that
+holds your `config.toml` (or point `$OCTI_RB_CONFIG` / `--config` at it).
 
 ## Checklist
 
 1. **Copy the example config**, if `config.toml` doesn't already exist:
 
    ```
-   cp config.example.toml config.toml
+   cp "${CLAUDE_PLUGIN_ROOT}/config.example.toml" config.toml
    ```
 
    Every key in `config.example.toml` is documented inline with its default.
@@ -53,7 +58,7 @@ running any of the other skills. Run every command from the repository root.
 4. **Run doctor:**
 
    ```
-   bin/octi-rb doctor
+   ${CLAUDE_PLUGIN_ROOT}/bin/octi-rb doctor
    ```
 
    It checks: platform connectivity, `reports()` connectivity, the sector
@@ -91,7 +96,7 @@ running any of the other skills. Run every command from the repository root.
      refresh\`` or `crosswalk cache is N day(s) old (max M)`** — run:
 
      ```
-     bin/octi-rb crosswalk refresh
+     ${CLAUDE_PLUGIN_ROOT}/bin/octi-rb crosswalk refresh
      ```
 
      This downloads and atomically caches the MISP threat-actor galaxy used
@@ -120,7 +125,7 @@ running any of the other skills. Run every command from the repository root.
 6. **Re-run doctor** after each fix:
 
    ```
-   bin/octi-rb doctor
+   ${CLAUDE_PLUGIN_ROOT}/bin/octi-rb doctor
    ```
 
    Repeat until it prints `doctor: OK` and exits 0. Only then move on to

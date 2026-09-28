@@ -67,8 +67,11 @@ cd OpenCTI-Relationship-Builder
 cp config.example.toml config.toml
 ```
 
-Either way, `octi-rb` runs as `bin/octi-rb` from the repository root — it
-needs no `pip install` step of its own, since it has no runtime
+From a clone, `octi-rb` runs as `bin/octi-rb` from the repository root.
+Installed as a plugin, the skills call it as `${CLAUDE_PLUGIN_ROOT}/bin/octi-rb`
+(Claude Code sets `CLAUDE_PLUGIN_ROOT` for plugin skills), and `config.toml`
+lives in your working directory (or wherever `--config` / `$OCTI_RB_CONFIG`
+points). Either way there is no `pip install` step, since it has no runtime
 dependencies.
 
 ## Quick start
@@ -99,9 +102,10 @@ dependencies.
    bin/octi-rb select --linker report-location --limit 25
    ```
 
-   Add `--all-reports` on a second or later pass over the same corpus
-   (the default only selects reports that don't already carry this
-   linker's containment).
+   The default skips any report that already contains **any** objects (of
+   any type, not only this linker's), so a second linker's default
+   `select` skips the reports the first one enriched. Use `--all-reports`
+   for a second linker pass over the same corpus.
 
 3. **Fetch** article text into the shared cache (report-* linkers only):
 
@@ -210,7 +214,17 @@ value aborts immediately, naming the offending key.
   objects are for filtering in the OpenCTI UI only.
 - **Revert never deletes what it didn't create.** Anything the ledger
   marks `preexisted: true` — a relationship, alias, or containment that
-  was already there — is left alone.
+  was already there — is left alone. `apply` checks each report's current
+  objects before adding a ref, so a ref the report already carried is
+  recorded `preexisted: true` rather than claimed.
+- **Checkpoint after every write.** `apply` saves `applied.json` after
+  each platform write, so a crash mid-batch never leaves a write the
+  ledger doesn't own. A row whose undo fails during `revert` stays in
+  `applied.json`; re-run `revert` to retry it.
+- **Review drops take an edit.** `--include-review` writes every
+  non-`hard_fail` item in `review.json`. To reject one, delete it from
+  `extractions.json` and re-validate (or delete its `review.json` row after
+  the last `validate`).
 
 ## Development
 
