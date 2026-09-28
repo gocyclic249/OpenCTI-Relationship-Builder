@@ -1,0 +1,63 @@
+# octi-rb example configuration.
+#
+# Copy this file to config.toml (or point --config / $OCTI_RB_CONFIG at your
+# own copy) and edit the values you need to change. Every key below is shown
+# at its built-in default, so an unmodified copy of this file behaves
+# identically to running octi-rb with no config file at all.
+#
+# The OpenCTI API token is NEVER read from this file. Set it in the
+# environment as $OPENCTI_TOKEN or $OPENCTI_ADMIN_TOKEN, or point
+# [platform].env_file at a .env file that defines one of those two names.
+#
+# config.py validates this file on every load and fails loud: an unknown
+# key, wrong type, or out-of-range value aborts with a message naming the
+# offending key.
+
+[platform]
+url = "http://localhost:8080"      # your OpenCTI platform base URL
+env_file = ""                      # optional path to a .env file holding OPENCTI_TOKEN
+
+[runs]
+dir = ""                           # default: $XDG_STATE_HOME/octi-rb/runs, else ~/.local/state/octi-rb/runs
+                                    # (the crosswalk/text cache lives beside it, in cache/)
+
+[labels]
+prefix = "AI-"                     # every label this tool writes starts with this prefix
+color = "#0d7d8c"                  # hex color for labels this tool creates
+
+[selection]
+since_days = 183                   # only consider reports published in the last N days; 0 = no limit
+sources = []                       # report author names to include; [] = all authors
+exclude_sources = []               # report author names to skip entirely
+exclude_title_patterns = []        # case-insensitive regexes; a matching report title is skipped
+# exclude_title_patterns = ["^ISC Stormcast"]   # SANS podcast listings — no extractable content
+
+[text]
+fulltext_min_chars = 2000          # tier 1: description at least this long is used as-is
+title_match_min = 0.5              # similarity guard: fetched capture vs. reference title (0.0-1.0)
+fetch_enabled = true               # tier 4: allow fetching article text via the ImportExternalReference connector
+fetch_exclude_sources = []         # report author names that are selected but never fetched
+fetch_hosts = []                   # allowlist of hosts fetch is permitted to hit; [] = any host
+# fetch_hosts = ["www.bleepingcomputer.com", "securelist.com"]  # optional allowlist; empty = any host
+max_fetch_per_run = 50             # hard cap on fetches per run; 0 = unlimited
+
+[disk]
+warn_percent = 75                  # warn when a watched filesystem is at least this full; 0 disables
+paths = []                         # extra mount points to watch, beyond the runs/cache directory
+# paths = ["/var/lib/docker"]                   # watch the mount your OpenCTI volumes live on
+
+[sectors]
+canonical_authors = ["Filigran"]   # sectors authored by these names are always in the canonical set
+extra_roots = []                   # additional sector subtrees to canonicalize, walked via part-of
+# extra_roots = ["ICS"]                         # your own sector tree, walked via part-of
+aliases = {}                       # platform sector name -> canonical sector name, for duplicates
+# aliases = { "Energy & Utilities" = "Energy" }
+
+[actors]
+create_missing_type = "Intrusion-Set"  # entity type minted by --create-missing (Intrusion-Set or Threat-Actor-Group)
+crosswalk_enabled = true               # allow the MISP galaxy synonym lookup as a resolution step
+crosswalk_max_age_days = 90            # doctor warns when the crosswalk cache is older than this
+alias_writeback = true                 # write stated actor-name equivalences back to the platform as aliases
+
+[vulns]
+enabled = true                     # allow the report-vuln linker (CVE regex + exact lookup)
