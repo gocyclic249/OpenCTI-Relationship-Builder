@@ -88,6 +88,11 @@ dependencies.
    the crosswalk cache age, the text-fetch connector, and disk space. Fix
    anything it flags before continuing.
 
+   `config.toml` is found in this order: the top-level `--config PATH`
+   flag, then `$OCTI_RB_CONFIG`, then `./config.toml` in the current
+   directory — so you can keep more than one config around (e.g. one per
+   platform) and select between them per invocation.
+
 2. **Select** a batch of reports (or actors) for one linker:
 
    ```
@@ -145,9 +150,12 @@ dependencies.
    ```
 
 `bin/octi-rb status` lists every run directory with its counts at each
-stage. Every command accepts `--run-id`: for `select` it names the new
-run (refused if it already exists); for every later command it selects
-an existing run, and omitted resolves to the most recently created one.
+stage. Every pipeline command (`select`, `fetch`, `structured`, `batch`,
+`validate`, `apply`, `revert`) accepts `--run-id`: for `select` it names
+the new run (refused if it already exists); for the rest it selects an
+existing run, and omitted resolves to the most recently created one.
+`status`, `doctor` and `crosswalk` take no `--run-id` — they aren't
+scoped to a single run.
 
 ## Linkers
 
