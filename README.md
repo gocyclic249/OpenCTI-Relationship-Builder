@@ -215,8 +215,9 @@ value aborts immediately, naming the offending key.
 ## Development
 
 ```
-ruff check octirb/ tests/
+ruff check octirb/ tests/ contrib/
 mypy --strict octirb/
+mypy --strict contrib/migrate-legacy-labels.py
 pytest -q
 shellcheck install-deps.sh
 ./install-deps.sh --check
