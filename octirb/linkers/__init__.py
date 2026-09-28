@@ -50,6 +50,23 @@ def _build_vulns(client: Client, cfg: Config) -> Resolver:  # noqa: ARG001 - cfg
     return VulnVocabulary(client)
 
 
+def _build_actor_target(client: Client, cfg: Config) -> Resolver:
+    """actor-target has no single-resolver shape: its `Context`
+    (`linkers.actor_target.Context`) needs an actor vocabulary, a target
+    resolver *per kind* (country/region/sector) and the relationship
+    schema all at once -- four collaborators, not the one `Resolver` this
+    hook is typed for. Building that Context is CLI-wiring work outside
+    this task's scope, so nothing in this codebase calls
+    `REGISTRY["actor-target"].build_resolver` yet; this raises rather than
+    pretend a single Resolver can stand in for four.
+    """
+    raise NotImplementedError(
+        "actor-target builds its Context (actors + per-kind targets + schema) "
+        "directly -- see octirb.linkers.actor_target.Context -- not through "
+        "Linker.build_resolver"
+    )
+
+
 REGISTRY: dict[str, Linker] = {
     "report-location": Linker(
         name="report-location",
@@ -94,6 +111,25 @@ REGISTRY: dict[str, Linker] = {
         write_kind="containment",
         needs_model=False,
         build_resolver=_build_vulns,
+        contract=None,
+    ),
+    "actor-target": Linker(
+        name="actor-target",
+        key_field="actor_id",
+        # Roles ("origin"/"targets") are validated by actor_target.validate's
+        # ENUMS against its own RELATIONSHIPS set, not by the pipeline's
+        # generic role check -- this linker's apply/validate flow never goes
+        # through octirb.pipeline, so an empty set here is correct, not TODO.
+        roles=frozenset(),
+        label_suffix="Relationship",
+        entity_kind="Relationship",
+        write_kind="relationship",
+        needs_model=True,
+        build_resolver=_build_actor_target,
+        # actor_target.render(source, sector_names, region_names) is its own
+        # per-source contract function, not a Resolver -> str closure like
+        # the containment linkers' `contract` field expects -- callers reach
+        # it directly instead of through this field.
         contract=None,
     ),
 }
