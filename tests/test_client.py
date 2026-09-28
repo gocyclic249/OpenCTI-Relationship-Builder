@@ -27,6 +27,12 @@ threat_actor_groups, so there was nothing to delete on that account.
 
 from __future__ import annotations
 
+import http.client
+import io
+import urllib.error
+import urllib.request
+from email.message import Message
+
 import pytest
 
 from octirb.client import ACTOR_MUTATIONS, OpenCTIError
@@ -220,3 +226,61 @@ def test_report_object_ids_missing_report_raises(fake_gql_client):
     client, _calls = fake_gql_client({"report": None})
     with pytest.raises(OpenCTIError):
         client.report_object_ids("r1")
+
+
+# -- transport error wrapping (I2) --------------------------------------------
+
+
+def _client():
+    from octirb.client import Client
+    from octirb.config import Settings
+
+    return Client(Settings(url="http://x", token="t"))  # noqa: S106 - placeholder, not a secret
+
+
+class _Body(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [TimeoutError("timed out"), ConnectionResetError("reset"), http.client.RemoteDisconnected("gone"),
+     http.client.IncompleteRead(b"")],
+)
+def test_gql_wraps_transport_errors(monkeypatch, exc):
+    def boom(*_a, **_k):
+        raise exc
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    with pytest.raises(OpenCTIError):
+        _client().gql("{ x }")
+
+
+def test_gql_wraps_a_non_json_body(monkeypatch):
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: _Body(b"<html>502</html>"))
+    with pytest.raises(OpenCTIError):
+        _client().gql("{ x }")
+
+
+def test_gql_rejects_a_non_object_payload(monkeypatch):
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_a, **_k: _Body(b"[1, 2]"))
+    with pytest.raises(OpenCTIError):
+        _client().gql("{ x }")
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [urllib.error.HTTPError("http://x/storage/get/f1", 404, "Not Found", Message(), None),
+     TimeoutError("timed out"), http.client.IncompleteRead(b"")],
+)
+def test_download_wraps_transport_errors(monkeypatch, exc):
+    def boom(*_a, **_k):
+        raise exc
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    with pytest.raises(OpenCTIError):
+        _client().download("f1")

@@ -227,6 +227,28 @@ def test_materialize_rejects_nonpositive_timeout(tmp_path, monkeypatch):
         materialize_text(client, Config(), cache, [], lambda _m: None, timeout=0)
 
 
+def test_one_failed_stored_file_does_not_abort_the_loop(tmp_path, monkeypatch):
+    """I2: a 404 on one stored file becomes that item's status; the next
+    report is still materialized and a status map is still returned."""
+    from octirb.client import OpenCTIError
+
+    class StoredFake(FetchFake):
+        def external_reference_files(self, ref_id):
+            return [{"id": f"f-{ref_id}", "name": "a.md", "size": 1}]
+
+        def download(self, file_id):
+            if file_id == "f-ref-r1":
+                raise OpenCTIError("HTTP Error 404")
+            return super().download(file_id)
+
+    monkeypatch.setattr("octirb.config.check_disk", lambda _c, _l: None)
+    items = [dataclasses.replace(selected(r), text_tier="stored-file") for r in ("r1", "r2")]
+    cache = TextCache(tmp_path)
+    status = materialize_text(StoredFake(), Config(), cache, items, lambda _m: None)  # type: ignore[arg-type]
+    assert status["r1"].startswith("error:")
+    assert cache.read("r2") is not None
+
+
 # -------------------------------------------------------------------- batch
 
 

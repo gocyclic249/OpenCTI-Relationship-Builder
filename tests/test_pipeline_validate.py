@@ -449,3 +449,29 @@ def test_alias_writes_absent_when_writeback_disabled():
     )
     assert len(auto) == 1
     assert "alias_writes" not in auto[0]
+
+
+def test_alias_writes_exclude_a_name_that_resolves_elsewhere(sample_actors, sample_malware):
+    """I3: spec -- chain names must co-resolve to the same entity or not
+    resolve at all. "Turla" is a different platform actor, so it must never be
+    written as an alias of APT29; the unresolved "UNC9999" still is."""
+    resolver = ActorVocabulary(sample_actors, sample_malware, label="AI-Created", create_type="Intrusion-Set")
+    auto, _ = pipeline.validate(
+        [item(actor="APT29", aliases=["Turla", "UNC9999"], confidence="high")],
+        resolver, IDS, ACTOR, writeback=True,
+    )
+    assert len(auto) == 1
+    assert auto[0]["alias_writes"] == ["UNC9999"]
+    assert auto[0]["alias_conflicts"] == ["Turla"]
+
+
+def test_alias_writes_keep_names_that_co_resolve(sample_actors, sample_malware):
+    """A chain name that resolves to the SAME entity is already a known
+    spelling -- neither written nor a conflict."""
+    resolver = ActorVocabulary(sample_actors, sample_malware, label="AI-Created", create_type="Intrusion-Set")
+    auto, _ = pipeline.validate(
+        [item(actor="APT29", aliases=["Cozy Bear"], confidence="high")],
+        resolver, IDS, ACTOR, writeback=True,
+    )
+    assert auto[0]["alias_writes"] == []
+    assert "alias_conflicts" not in auto[0]

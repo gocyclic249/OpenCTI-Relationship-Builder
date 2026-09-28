@@ -264,6 +264,25 @@ def test_structured_merges_extractions(tmp_path: Path, monkeypatch: pytest.Monke
 # ---------------------------------------------------------------- validate
 
 
+def test_structured_rerun_does_not_duplicate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_dir = tmp_path / "r1"
+    write_meta(run_dir, linker="report-location")
+    (run_dir / "batch.json").write_text("[]")
+    cfg = make_cfg(tmp_path)
+    monkeypatch.setattr(cli, "_load_cfg", lambda _args: cfg)
+    extra = [{"report_id": "r1", "iso3": "FRA"}]
+    monkeypatch.setattr(cli.structured, "parse", lambda _b, _l: (list(extra), 1))
+    assert cli.cmd_structured(ns(run_id="r1")) == cli.EXIT_OK
+    assert cli.cmd_structured(ns(run_id="r1")) == cli.EXIT_OK
+    assert json.loads((run_dir / "extractions.json").read_text()) == extra
+
+
+def test_doctor_crosswalk_missing_is_a_warning(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    cfg = make_cfg(tmp_path / "runs")  # cache_dir = tmp_path/cache: empty
+    assert cli._doctor_crosswalk(cfg) is True
+    assert "WARNING" in capsys.readouterr().err
+
+
 def test_cmd_validate_non_array_exit2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     run_dir = tmp_path / "r1"
     write_meta(run_dir, linker="report-vuln")

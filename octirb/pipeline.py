@@ -326,6 +326,22 @@ def _materialize_stored_file(
     return status
 
 
+def _materialize_stored(client: Client, cache: TextCache, item: Selected, text_cfg: TextCfg) -> str:
+    """The description and stored-file tiers, with a per-item error status.
+
+    One unreadable report (or one 404 on a stored file) becomes that item's
+    status rather than aborting the loop before fetch_status.json is written.
+    """
+    if item.text_tier not in ("description", "stored-file"):
+        raise ValueError(f"_materialize_stored: not a stored tier: {item.text_tier!r}")
+    try:
+        if item.text_tier == "description":
+            return _materialize_description(client, cache, item)
+        return _materialize_stored_file(client, cache, item, text_cfg)
+    except OpenCTIError as exc:
+        return f"error: {exc}"[:160]
+
+
 def _materialize_fetch(  # noqa: PLR0913,PLR0917 - one argument per fetch/cap parameter
     client: Client,
     cache: TextCache,
@@ -382,10 +398,8 @@ def materialize_text(  # noqa: PLR0913 - client/cfg/cache/selection/log/timeout,
     for item in selection:
         if cache.has(item.report_id):
             status[item.report_id] = "cached"
-        elif item.text_tier == "description":
-            status[item.report_id] = _materialize_description(client, cache, item)
-        elif item.text_tier == "stored-file":
-            status[item.report_id] = _materialize_stored_file(client, cache, item, cfg.text)
+        elif item.text_tier in ("description", "stored-file"):
+            status[item.report_id] = _materialize_stored(client, cache, item, cfg.text)
         elif item.text_tier == "fetch":
             state, fetch_count = _materialize_fetch(
                 client, cache, item, cfg.text, log, connector, timeout, max_fetch, fetch_count
@@ -498,17 +512,47 @@ def _crosswalk_chain(item: JsonDict, linker: Linker, resolver: Resolver) -> tupl
     return None
 
 
-def _alias_writes(item: JsonDict, linker: Linker, resolved: Resolved) -> list[str]:
-    """Chain names that are not already a known spelling of `resolved`.
+def _alias_writes(
+    item: JsonDict, linker: Linker, resolver: Resolver, resolved: Resolved
+) -> tuple[list[str], list[str]]:
+    """(writes, conflicts): chain names to add as aliases of `resolved`, and
+    chain names that must not be.
 
-    Candidates for `client.add_entity_alias` in `apply_containment`: a
-    report calling APT29 "ICE RELIC" is new information worth recording as
-    an alias, but "APT29" itself or a spelling the platform already lists
-    is not.
+    A report calling APT29 "ICE RELIC" is new information worth recording
+    as an alias, but "APT29" itself or a spelling the platform already
+    lists is not. And per the spec, chain names must co-resolve to the same
+    entity or not resolve at all: a name that resolves to a DIFFERENT
+    platform entity (feeds often carry "Cozy Bear" as its own
+    Threat-Actor-Group) is a conflict -- writing it would make two entities
+    claim one name -- so it is excluded and reported, never written.
     """
+    if not resolved.id:
+        raise ValueError("_alias_writes: resolved entity has no id")
     known = {normalise(resolved.name)}
     known.update(normalise(a) for a in getattr(resolved, "aliases", ()))
-    return [name for name in _chain_keys(item, linker) if normalise(name) not in known]
+    writes: list[str] = []
+    conflicts: list[str] = []
+    for name in _chain_keys(item, linker):
+        if normalise(name) in known:
+            continue
+        other = resolver.resolve(name)
+        if other is None:
+            writes.append(name)
+        elif other.id != resolved.id:
+            conflicts.append(name)
+    if set(writes) & set(conflicts):
+        raise RuntimeError("_alias_writes: a name is both a write and a conflict")
+    return writes, conflicts
+
+
+def _stamp_alias_writes(item: JsonDict, linker: Linker, resolver: Resolver, resolved: Resolved) -> None:
+    """Record `alias_writes` (and any `alias_conflicts`) on the item."""
+    if not linker.alias_field:
+        raise ValueError(f"_stamp_alias_writes: linker {linker.name} has no alias chain")
+    writes, conflicts = _alias_writes(item, linker, resolver, resolved)
+    item["alias_writes"] = writes
+    if conflicts:
+        item["alias_conflicts"] = conflicts
 
 
 def _reasons_for(
@@ -545,7 +589,7 @@ def _reasons_for(
     else:
         _entity_fields(item, resolved)
         if via_crosswalk is None and writeback and linker.alias_field:
-            item["alias_writes"] = _alias_writes(item, linker, resolved)
+            _stamp_alias_writes(item, linker, resolver, resolved)
 
     if str(item.get("role") or "").lower() not in linker.roles:
         reasons.append(f"invalid role {item.get('role')!r} (expected one of {sorted(linker.roles)})")

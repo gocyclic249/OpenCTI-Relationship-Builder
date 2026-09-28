@@ -89,10 +89,13 @@ def cmd_select(args: Namespace) -> int:
     if args.linker == "actor-target" and args.source not in ("description", "report"):
         _log("select --linker actor-target requires --source description|report")
         return EXIT_BAD_RUN
+    if args.linker == "actor-target" and (args.since_days or args.all_reports):
+        _log("select: --since-days/--all-reports do not apply to actor-target; ignored")
     runs_dir = cfg.runs_dir
     if args.run_id and (runs_dir / args.run_id / META).is_file():
         _log(f"run {args.run_id} already exists in {runs_dir} — choose a new --run-id or omit it")
         return EXIT_BAD_RUN
+    config.check_disk(cfg, _log)
     client = _client(cfg)
     run = Run(runs_dir / (args.run_id or new_run_id()))
     count = _select_write(client, cfg, run, args)
@@ -198,11 +201,14 @@ def cmd_structured(args: Namespace) -> int:
     batch = run.read_json("batch.json")
     extra, covered = structured.parse(batch, linker_name)
     prior = run.read_json("extractions.json") if run.has("extractions.json") else []
-    merged = [*prior, *extra]
+    # Re-running structured must not append the same parser output twice.
+    seen = {json.dumps(e, sort_keys=True) for e in prior}
+    fresh = [e for e in extra if json.dumps(e, sort_keys=True) not in seen]
+    merged = [*prior, *fresh]
     run.write_json("extractions.json", merged)
     print(
         f"run {run.run_id}: {covered} packet(s) matched a structured parser; "
-        f"{len(extra)} extraction(s) added ({len(merged)} total)"
+        f"{len(fresh)} extraction(s) added ({len(merged)} total)"
     )
     return EXIT_OK
 
@@ -549,12 +555,13 @@ def _doctor_crosswalk(cfg: Config) -> bool:
         print("doctor: crosswalk disabled ([actors].crosswalk_enabled = false)")
         return True
     age = crosswalk.Crosswalk.age_days(cfg.cache_dir)
+    # Warnings, not failures (spec): the crosswalk is an optional resolver tier.
     if age is None:
-        _log("doctor: crosswalk cache missing; run `octi-rb crosswalk refresh`")
-        return False
+        _log("doctor: WARNING crosswalk cache missing; run `octi-rb crosswalk refresh`")
+        return True
     if age > cfg.actors.crosswalk_max_age_days:
-        _log(f"doctor: crosswalk cache is {age} day(s) old (max {cfg.actors.crosswalk_max_age_days})")
-        return False
+        _log(f"doctor: WARNING crosswalk cache is {age} day(s) old (max {cfg.actors.crosswalk_max_age_days})")
+        return True
     print(f"doctor: crosswalk cache OK ({age} day(s) old)")
     return True
 
@@ -569,11 +576,12 @@ def _doctor_fetch_connector(client: Client, cfg: Config) -> bool:
         _log(f"doctor: connector lookup failed: {exc}")
         return False
     if record is None or not record.get("active"):
+        # Presence noted, not a failure (spec): only fetch-tier reports need it.
         _log(
-            f"doctor: connector {pipeline.CONNECTOR_NAME} not present/active; "
+            f"doctor: WARNING connector {pipeline.CONNECTOR_NAME} not present/active; "
             "fetch-tier reports will be skipped"
         )
-        return False
+        return True
     print(f"doctor: connector {pipeline.CONNECTOR_NAME} active")
     return True
 

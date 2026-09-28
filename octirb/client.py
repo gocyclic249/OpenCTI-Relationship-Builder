@@ -18,9 +18,9 @@ create_threat_actor_group did.
 
 from __future__ import annotations
 
+import http.client
 import json
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Iterator
@@ -43,6 +43,12 @@ MAX_CONFIDENCE = 100
 MAX_VULN_NAMES = 500
 
 ALLOWED_SCHEMES = frozenset({"http", "https"})
+
+# Every transport failure urlopen/read can raise: URLError/HTTPError, socket
+# timeouts and resets are OSError; a truncated or malformed HTTP response is
+# http.client.HTTPException (not an OSError). Wrapped as OpenCTIError so
+# callers' per-item handling and main()'s exit contract see one type.
+TRANSPORT_ERRORS = (OSError, http.client.HTTPException)
 
 
 class OpenCTIError(RuntimeError):
@@ -159,8 +165,12 @@ class Client:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:  # noqa: S310 - checked
                 payload = json.load(r)
-        except urllib.error.URLError as exc:
+        except TRANSPORT_ERRORS as exc:
             raise OpenCTIError(f"OpenCTI unreachable at {self.s.url}: {exc}") from exc
+        except ValueError as exc:  # JSONDecodeError/UnicodeDecodeError: an HTML error page, say
+            raise OpenCTIError(f"OpenCTI returned a non-JSON response: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise OpenCTIError(f"GraphQL response is not a JSON object: {str(payload)[:300]}")
         if "errors" in payload:
             raise OpenCTIError(json.dumps(payload["errors"])[:1000])
         data = payload.get("data")
@@ -192,8 +202,11 @@ class Client:
         if not file_id:
             raise OpenCTIError("download() needs a file id")
         req = _checked_request(self.s.storage_url(file_id), self.s.token)
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:  # noqa: S310 - checked
-            text = r.read().decode("utf-8", errors="replace")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:  # noqa: S310 - checked
+                text = r.read().decode("utf-8", errors="replace")
+        except TRANSPORT_ERRORS as exc:
+            raise OpenCTIError(f"download of file {file_id} failed: {exc}") from exc
         return str(text)
 
     # ------------------------------------------------------------------- reads
