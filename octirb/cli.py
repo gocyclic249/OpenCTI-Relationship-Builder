@@ -366,15 +366,33 @@ def _revert_relationships(
 
 
 def _revert_entities(
-    args: Namespace, cfg: Config, run: Run, client: Client, rows: list[JsonDict]
+    args: Namespace, cfg: Config, client: Client, rows: list[JsonDict], retain: list[JsonDict]
 ) -> tuple[int, int]:
+    """Purge entities --create-missing minted. The label checked is the one
+    minting stamps (`ActorVocabulary.create`: `cfg.label("Created")`), never
+    the run's linker label -- which a minted entity does not carry."""
     entity_types = {str(r["entity_id"]): str(r["entity_type"]) for r in rows if r.get("kind") == "entity"}
     if not entity_types:
         return (0, 0)
-    label = cfg.label(get(run.linker()).label_suffix)
     return pipeline.purge_created(
-        client, rows, _log, dry_run=args.dry_run, label=label, entity_types=entity_types
+        client, rows, _log, dry_run=args.dry_run, label=cfg.label("Created"),
+        entity_types=entity_types, retain=retain,
     )
+
+
+def _split_reverted(rows: list[JsonDict], retain: list[JsonDict]) -> tuple[list[JsonDict], list[JsonDict]]:
+    """(still owned, done) -- partitioned by row identity, original order kept.
+
+    "Done" covers rows undone and rows correctly kept (preexisted, adopted,
+    already gone); "still owned" is every row whose undo failed or whose
+    entity is still referenced, which must stay in applied.json for a retry.
+    """
+    keep_ids = {id(r) for r in retain}
+    owned = [r for r in rows if id(r) in keep_ids]
+    done = [r for r in rows if id(r) not in keep_ids]
+    if len(owned) + len(done) != len(rows):
+        raise RuntimeError("_split_reverted lost a row")
+    return owned, done
 
 
 def cmd_revert(args: Namespace) -> int:
@@ -386,18 +404,25 @@ def cmd_revert(args: Namespace) -> int:
         return EXIT_BAD_RUN
     rows: list[JsonDict] = raw
     client = _client(cfg)
-    n_contain = pipeline.revert_containment(client, rows, _log, dry_run=args.dry_run)
-    n_alias = pipeline.revert_aliases(client, rows, _log, dry_run=args.dry_run)
+    retain: list[JsonDict] = []
+    n_contain = pipeline.revert_containment(client, rows, _log, dry_run=args.dry_run, retain=retain)
+    n_alias = pipeline.revert_aliases(client, rows, _log, dry_run=args.dry_run, retain=retain)
     n_rel_del, n_rel_kept = _revert_relationships(args, cfg, client, rows)
-    n_ent_del, n_ent_kept = _revert_entities(args, cfg, run, client, rows)
+    n_ent_del, n_ent_kept = _revert_entities(args, cfg, client, rows, retain)
+    owned, done = _split_reverted(rows, retain)
     if not args.dry_run:
+        # Only what was actually finished leaves the ledger. A row whose undo
+        # failed stays in applied.json, so re-running revert retries it rather
+        # than the write becoming permanently unrevertable.
         prior_reverted = run.read_json("reverted.json") if run.has("reverted.json") else []
-        run.write_json("reverted.json", [*prior_reverted, *rows])
-        run.write_json("applied.json", [])
+        run.write_json("reverted.json", [*prior_reverted, *done])
+        run.write_json("applied.json", owned)
     print(
         f"run {run.run_id}: containment {n_contain}, aliases {n_alias}, "
         f"relationships {n_rel_del}/{n_rel_kept} kept, entities {n_ent_del}/{n_ent_kept} kept"
     )
+    if owned and not args.dry_run:
+        _log(f"run {run.run_id}: {len(owned)} row(s) still owned; re-run revert to retry them")
     return EXIT_OK
 
 

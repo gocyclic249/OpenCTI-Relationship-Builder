@@ -9,6 +9,7 @@ SystemExit(str)-remap contract, via `cli.COMMANDS` monkeypatching.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from argparse import Namespace
 from pathlib import Path
@@ -17,10 +18,11 @@ from typing import Any
 import pytest
 
 from octirb import cli, ledger
-from octirb.client import OpenCTIError
-from octirb.config import Config, RunsCfg
+from octirb.client import ACTOR_DELETES, OpenCTIError
+from octirb.config import ActorsCfg, Config, RunsCfg
 from octirb.linkers import REGISTRY
 from octirb.linkers.base import Linker
+from octirb.resolvers.actors import ActorVocabulary
 from octirb.runstore import TextCache
 
 
@@ -403,7 +405,10 @@ class MixedRevertFakeClient:
         self.deleted_relationships.append(rel_id)
 
     def entity_labels(self, entity_id: str) -> list[str]:
-        return ["AI-Location"]
+        # The label ActorVocabulary.create stamps on a minted entity -- NOT
+        # the run's linker label. This fake used to return the linker label
+        # (AI-Location), which is what let the C1 label mismatch pass.
+        return ["AI-Created"]
 
     def entity_reference_counts(self, entity_id: str) -> tuple[int, int]:
         return (0, 0)
@@ -445,6 +450,166 @@ def test_revert_filters_rows_by_kind(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert fake.removed_aliases == [("e2", "ICE RELIC")]
     assert fake.deleted_relationships == ["rel-1"]
     assert fake.deleted_actors == [("Intrusion-Set", "e3")]
+
+
+class MintRevertFakeClient:
+    """Plays both ends of the create-missing seam: apply mints through the
+    REAL ActorVocabulary.create (so the label and entity_type on the platform
+    are whatever the producer actually stamps), revert purges through
+    delete_actor, which -- like the real client -- only accepts the actor
+    types it has a delete mutation for, and only the type the entity has."""
+
+    def __init__(self) -> None:
+        self.label_values: dict[str, str] = {}
+        self.entity_type: dict[str, str] = {}
+        self.entity_label: dict[str, list[str]] = {}
+        self.report_objects: dict[str, set[str]] = {}
+        self.deleted: list[tuple[str, str]] = []
+
+    def ensure_label(self, value: str, color: str) -> str:
+        self.label_values[f"label-{value}"] = value
+        return f"label-{value}"
+
+    def create_actor(self, entity_type: str, name: str, aliases: list[str], label_id: str) -> str:
+        self.entity_type["minted-1"] = entity_type
+        self.entity_label["minted-1"] = [self.label_values[label_id]]
+        return "minted-1"
+
+    def report_object_ids(self, report_id: str) -> set[str]:
+        return set(self.report_objects.get(report_id, set()))
+
+    def add_object_to_report(self, report_id: str, object_id: str) -> None:
+        self.report_objects.setdefault(report_id, set()).add(object_id)
+
+    def add_label_to_report(self, report_id: str, label_id: str) -> None:
+        return None
+
+    def remove_object_from_report(self, report_id: str, object_id: str) -> None:
+        self.report_objects.get(report_id, set()).discard(object_id)
+
+    def remove_label_from_report(self, report_id: str, label_id: str) -> None:
+        return None
+
+    def entity_labels(self, entity_id: str) -> list[str]:
+        return list(self.entity_label.get(entity_id, []))
+
+    def entity_reference_counts(self, entity_id: str) -> tuple[int, int]:
+        containers = sum(1 for objs in self.report_objects.values() if entity_id in objs)
+        return (0, containers)
+
+    def delete_actor(self, entity_type: str, entity_id: str) -> None:
+        if entity_type not in ACTOR_DELETES or entity_type != self.entity_type.get(entity_id):
+            raise OpenCTIError(f"delete_actor: wrong entity_type {entity_type!r} for {entity_id}")
+        self.deleted.append((entity_type, entity_id))
+        self.entity_label.pop(entity_id, None)
+
+
+def _minting_actor_linker() -> Linker:
+    def build(client: Any, cfg: Config) -> ActorVocabulary:
+        return ActorVocabulary(
+            [], [], client, label=cfg.label("Created"), create_type=cfg.actors.create_missing_type
+        )
+
+    return dataclasses.replace(REGISTRY["report-actor"], build_resolver=build)
+
+
+def test_revert_purges_entity_minted_by_create_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C1: apply --create-missing then revert must delete the minted entity.
+
+    Feeds the real producer's output (create_missing -> apply_containment ->
+    applied.json) into cmd_revert, rather than a hand-built entity row, so a
+    label or entity_type disagreement between the two ends fails here.
+    """
+    run_dir = tmp_path / "r1"
+    write_meta(run_dir, linker="report-actor")
+    creatable = {
+        "report_id": "rep-1", "actor": "WaterPlum", "aliases": [], "role": "attributed",
+        "confidence": "high", "evidence": "WaterPlum did it", "creatable": True,
+        "hard_fail": True, "review_reasons": ["unresolved actor 'WaterPlum'"],
+    }
+    (run_dir / "auto.json").write_text("[]")
+    (run_dir / "review.json").write_text(json.dumps([creatable]))
+    cfg = make_cfg(tmp_path, actors=ActorsCfg(create_missing_type="Threat-Actor-Group"))
+    monkeypatch.setattr(cli, "_load_cfg", lambda _args: cfg)
+    fake = MintRevertFakeClient()
+    monkeypatch.setattr(cli, "_client", lambda _cfg: fake)
+    minting = _minting_actor_linker()
+    monkeypatch.setattr(cli, "get", lambda _name: minting)
+
+    assert cli.cmd_apply(ns(run_id="r1", create_missing=True)) == cli.EXIT_OK
+    applied = json.loads((run_dir / "applied.json").read_text())
+    entity_rows = [r for r in applied if r["kind"] == "entity"]
+    assert entity_rows == [
+        {"kind": "entity", "entity_id": "minted-1", "entity_type": "Threat-Actor-Group", "name": "WaterPlum"}
+    ]
+
+    assert cli.cmd_revert(ns(run_id="r1")) == cli.EXIT_OK
+    assert fake.deleted == [("Threat-Actor-Group", "minted-1")]
+    assert json.loads((run_dir / "applied.json").read_text()) == []
+
+
+class FlakyRevertFakeClient(MixedRevertFakeClient):
+    """Fails exactly one containment removal and one alias removal."""
+
+    def remove_object_from_report(self, report_id: str, object_id: str) -> None:
+        if object_id == "e-bad":
+            raise OpenCTIError("transient")
+        super().remove_object_from_report(report_id, object_id)
+
+    def remove_entity_alias(self, entity_id: str, alias: str) -> None:
+        if alias == "BAD ALIAS":
+            raise OpenCTIError("transient")
+        super().remove_entity_alias(entity_id, alias)
+
+
+def _crow(entity_id: str, *, created: bool = False) -> dict[str, Any]:
+    return ledger.containment_row(
+        report_id="r1", entity_id=entity_id, entity_name=entity_id, linker="report-actor",
+        key=entity_id, role="attributed", confidence="high", evidence="q", label_id=None,
+        created=created,
+    )
+
+
+def test_revert_keeps_failed_rows_in_applied(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """I8: a row whose undo failed stays in applied.json for a retry; rows
+    undone (or correctly kept) move to reverted.json."""
+    run_dir = tmp_path / "r1"
+    write_meta(run_dir, linker="report-actor")
+    good, bad = _crow("e-good"), _crow("e-bad")
+    alias_ok = ledger.alias_row(entity_id="e2", entity_name="X", alias="OK", preexisted=False, evidence="q")
+    alias_bad = ledger.alias_row(entity_id="e2", entity_name="X", alias="BAD ALIAS", preexisted=False, evidence="q")
+    (run_dir / "applied.json").write_text(json.dumps([good, bad, alias_ok, alias_bad]))
+    cfg = make_cfg(tmp_path)
+    monkeypatch.setattr(cli, "_load_cfg", lambda _args: cfg)
+    monkeypatch.setattr(cli, "_client", lambda _cfg: FlakyRevertFakeClient())
+
+    assert cli.cmd_revert(ns(run_id="r1")) == cli.EXIT_OK
+    assert json.loads((run_dir / "applied.json").read_text()) == [bad, alias_bad]
+    assert json.loads((run_dir / "reverted.json").read_text()) == [good, alias_ok]
+
+
+def test_revert_retains_entity_rows_still_owned(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """I8: an entity kept because it is still referenced stays ours -- its row
+    stays in applied.json so a later revert can purge it once orphaned."""
+
+    class StillReferenced(MixedRevertFakeClient):
+        def entity_reference_counts(self, entity_id: str) -> tuple[int, int]:
+            return (1, 0)
+
+    run_dir = tmp_path / "r1"
+    write_meta(run_dir, linker="report-actor")
+    entity = ledger.entity_row(entity_id="e3", entity_type="Intrusion-Set", name="WaterPlum")
+    (run_dir / "applied.json").write_text(json.dumps([_crow("e3", created=True), entity]))
+    cfg = make_cfg(tmp_path)
+    monkeypatch.setattr(cli, "_load_cfg", lambda _args: cfg)
+    fake = StillReferenced()
+    monkeypatch.setattr(cli, "_client", lambda _cfg: fake)
+
+    assert cli.cmd_revert(ns(run_id="r1")) == cli.EXIT_OK
+    assert fake.deleted_actors == []
+    assert json.loads((run_dir / "applied.json").read_text()) == [entity]
 
 
 # ------------------------------------------------------------------- status

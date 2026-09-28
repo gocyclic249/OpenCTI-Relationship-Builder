@@ -685,6 +685,10 @@ def create_missing(
             continue
         item["entity_id"] = entity.id
         item["entity_name"] = entity.name
+        # The platform type actually minted (e.g. "Intrusion-Set"), NOT
+        # linker.entity_kind ("Actor"): revert's delete_actor dispatches on
+        # it, and a display-kind there makes every minted entity undeletable.
+        item["entity_type"] = str(getattr(entity, "entity_type", "") or "")
         item["created"] = True
         item.pop("review_reasons", None)
         item.pop("hard_fail", None)
@@ -793,6 +797,9 @@ def _apply_one(  # noqa: PLR0913,PLR0917 - client/item/linker/label state/alias 
     rid = str(item.get("report_id") or "")
     if not entity_id or not rid:
         raise OpenCTIError(f"approved item has no entity/report id: {str(item)[:160]}")
+    created_type = str(item.get("entity_type") or "")
+    if item.get("created") and not created_type:
+        raise OpenCTIError(f"created item has no minted entity_type: {str(item)[:160]}")
 
     try:
         row_label = _apply_write(client, rid, entity_id, label_id, labelled, dry_run=dry_run)
@@ -809,7 +816,7 @@ def _apply_one(  # noqa: PLR0913,PLR0917 - client/item/linker/label state/alias 
 
     if item.get("created") and entity_id not in seen_entities:
         seen_entities.add(entity_id)
-        rows.append(ledger.entity_row(entity_id=entity_id, entity_type=linker.entity_kind, name=entity_name))
+        rows.append(ledger.entity_row(entity_id=entity_id, entity_type=created_type, name=entity_name))
 
     if item.get("alias_writes") and str(item.get("confidence") or "").lower() == AUTO_CONFIDENCE:
         rows.extend(
@@ -853,11 +860,20 @@ def apply_containment(  # noqa: PLR0913 - client/approved/log/linker/cfg/dry_run
 # ---------------------------------------------------------------------- revert
 
 
-def revert_containment(client: Client, rows: list[JsonDict], log: Log, *, dry_run: bool = False) -> int:
+def revert_containment(
+    client: Client, rows: list[JsonDict], log: Log, *, dry_run: bool = False,
+    retain: list[JsonDict] | None = None,
+) -> int:
     """Undo `apply_containment`'s `"containment"` rows: strip the objectRef
-    and, the first time each report's label is seen, its label too."""
+    and, the first time each report's label is seen, its label too.
+
+    A row whose undo raised is appended to `retain` (when given): the write
+    is still on the platform and still ours, so the caller keeps it in the
+    ledger for a retry instead of forgetting it.
+    """
     if not isinstance(rows, list):
         raise TypeError("revert_containment: rows must be a list")
+    failed = retain if retain is not None else []
 
     reverted = 0
     seen_labels: set[tuple[str, str]] = set()
@@ -882,20 +898,27 @@ def revert_containment(client: Client, rows: list[JsonDict], log: Log, *, dry_ru
             reverted += 1
         except OpenCTIError as exc:
             log(f"  ! revert {rid}: {exc}"[:200])
+            failed.append(row)
 
     if reverted > len(rows):
         raise RuntimeError("revert_containment reverted more rows than it was given")
     return reverted
 
 
-def revert_aliases(client: Client, rows: list[JsonDict], log: Log, *, dry_run: bool = False) -> int:
+def revert_aliases(
+    client: Client, rows: list[JsonDict], log: Log, *, dry_run: bool = False,
+    retain: list[JsonDict] | None = None,
+) -> int:
     """Undo `apply_containment`'s `"alias"` rows.
 
     A preexisted alias is left alone -- it was on the platform before this
     run touched it, so removing it would destroy data this run doesn't own.
+    A row whose removal raised is appended to `retain` (see
+    `revert_containment`).
     """
     if not isinstance(rows, list):
         raise TypeError("revert_aliases: rows must be a list")
+    failed = retain if retain is not None else []
 
     reverted = 0
     for row in rows:
@@ -918,6 +941,7 @@ def revert_aliases(client: Client, rows: list[JsonDict], log: Log, *, dry_run: b
             reverted += 1
         except OpenCTIError as exc:
             log(f"  ! revert alias {alias}: {exc}"[:200])
+            failed.append(row)
 
     if reverted > len(rows):
         raise RuntimeError("revert_aliases reverted more rows than it was given")
@@ -933,12 +957,14 @@ def _purge_decide_one(  # noqa: PLR0913 - client/target/own_refs/log/dry_run/lab
     dry_run: bool,
     label: str,
     entity_type: str,
-) -> Literal["deleted", "kept"] | None:
+) -> Literal["deleted", "adopted", "retained"] | None:
     """Inspect and, if orphaned, delete a single created entity.
 
-    `target` is (entity_id, name). Returns "deleted", "kept", or None if the
-    entity is already gone (which counts as neither, so a second revert is
-    idempotent).
+    `target` is (entity_id, name). Returns "deleted"; "adopted" (kept because
+    it no longer carries our label -- no longer ours, nothing to retry);
+    "retained" (kept but still ours: still referenced, or inspection/delete
+    failed -- a later revert should try again); or None if the entity is
+    already gone (which counts as neither, so a second revert is idempotent).
     """
     entity_id, name = target
     try:
@@ -949,7 +975,7 @@ def _purge_decide_one(  # noqa: PLR0913 - client/target/own_refs/log/dry_run/lab
         relationships, containers = client.entity_reference_counts(entity_id)
     except OpenCTIError as exc:
         log(f"  ! inspect {name}: {exc}"[:200])
-        return "kept"
+        return "retained"
 
     # In a dry run, revert_containment() has NOT stripped our objectRefs
     # yet, so the container count still includes them and the entity looks
@@ -960,12 +986,13 @@ def _purge_decide_one(  # noqa: PLR0913 - client/target/own_refs/log/dry_run/lab
     if dry_run:
         containers = max(0, containers - own_refs)
 
+    labelled = label in labels
     ok, why = ledger.should_delete_entity(
-        labelled=label in labels, relationships=relationships, containers=containers
+        labelled=labelled, relationships=relationships, containers=containers
     )
     if not ok:
         log(f"  kept {name}: {why}")
-        return "kept"
+        return "retained" if labelled else "adopted"
     if dry_run:
         log(f"  would delete {name}: {why}")
         return "deleted"
@@ -973,7 +1000,7 @@ def _purge_decide_one(  # noqa: PLR0913 - client/target/own_refs/log/dry_run/lab
         client.delete_actor(entity_type, entity_id)
     except OpenCTIError as exc:
         log(f"  ! delete {name}: {exc}"[:200])
-        return "kept"
+        return "retained"
     else:
         return "deleted"
 
@@ -986,6 +1013,7 @@ def purge_created(  # noqa: PLR0913 - client/rows/log/dry_run/label/entity_types
     dry_run: bool,
     label: str,
     entity_types: dict[str, str],
+    retain: list[JsonDict] | None = None,
 ) -> tuple[int, int]:
     """Delete entities this run created, but only while they stay orphaned.
 
@@ -1000,17 +1028,18 @@ def purge_created(  # noqa: PLR0913 - client/rows/log/dry_run/label/entity_types
     entity `apply_containment` minted), and `"containment"` rows with
     `created=True` count each entity's own-report references for the
     dry-run discount above.
+
+    `label` is the label minting stamps (`cfg.label("Created")`), not the
+    run's linker label. An entity kept while still ours (still referenced,
+    or inspection/delete failed) has its `"entity"` row appended to `retain`
+    (when given), so the caller keeps it in the ledger for a later revert.
     """
     if not isinstance(rows, list):
         raise TypeError("purge_created: rows must be a list")
     if not label:
         raise ValueError("purge_created: label must be non-empty")
 
-    targets = {
-        str(row["entity_id"]): str(row.get("name") or row["entity_id"])
-        for row in rows
-        if row.get("kind") == "entity"
-    }
+    targets = {str(row["entity_id"]): row for row in rows if row.get("kind") == "entity"}
     own_refs: dict[str, int] = {}
     for row in rows:
         if row.get("kind") == "containment" and row.get("created"):
@@ -1018,7 +1047,8 @@ def purge_created(  # noqa: PLR0913 - client/rows/log/dry_run/label/entity_types
             own_refs[entity_id] = own_refs.get(entity_id, 0) + 1
 
     deleted = kept = 0
-    for entity_id, name in targets.items():
+    for entity_id, target_row in targets.items():
+        name = str(target_row.get("name") or entity_id)
         entity_type = entity_types.get(entity_id)
         if entity_type is None:
             raise OpenCTIError(f"purge_created: no entity_type given for {name} ({entity_id})")
@@ -1028,8 +1058,10 @@ def purge_created(  # noqa: PLR0913 - client/rows/log/dry_run/label/entity_types
         )
         if outcome == "deleted":
             deleted += 1
-        elif outcome == "kept":
+        elif outcome is not None:
             kept += 1
+            if outcome == "retained" and retain is not None:
+                retain.append(target_row)
 
     if deleted + kept > len(targets):
         raise RuntimeError("purge_created counted more outcomes than targets")

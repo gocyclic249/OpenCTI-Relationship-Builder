@@ -26,6 +26,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from octirb import ledger, pipeline
 from octirb.client import OpenCTIError
 from octirb.config import Config
@@ -40,7 +42,10 @@ def _actor_linker() -> Linker:
         key_field="actor",
         roles=frozenset({"attributed", "mentioned"}),
         label_suffix="Actor",
-        entity_kind="Intrusion-Set",
+        # The real registry value. This used to be "Intrusion-Set", which
+        # hid C1: apply stamped entity_kind onto the entity row, and only
+        # this fake made that happen to be a deletable type.
+        entity_kind="Actor",
         write_kind="containment",
         needs_model=True,
         build_resolver=lambda _c, _cfg: None,  # type: ignore[return-value]
@@ -212,7 +217,7 @@ def test_dry_run_apply_mutates_nothing():
     client = FakeClient()
     cfg = Config()
     _, log = logs()
-    approved = [item(alias_writes=["ICE RELIC"], created=True)]
+    approved = [item(alias_writes=["ICE RELIC"], created=True, entity_type="Intrusion-Set")]
     rows = pipeline.apply_containment(client, approved, log, ACTOR, cfg, dry_run=True)
     assert client.added_objects == []
     assert client.removed_objects == []
@@ -369,10 +374,67 @@ def test_apply_stamps_the_created_flag_onto_the_ledger():
     purge_created has nothing to filter on -- the defect a live end-to-end
     run caught upstream."""
     cfg = Config()
-    minted = item(entity_id="e1", entity_name="WaterPlum", created=True)
+    minted = item(entity_id="e1", entity_name="WaterPlum", created=True, entity_type="Intrusion-Set")
     ordinary = item(report_id="r2", entity_id="e2", entity_name="SaltTyphoon", created=False)
     _, log = logs()
     rows = pipeline.apply_containment(None, [minted, ordinary], log, ACTOR, cfg, dry_run=True)  # type: ignore[arg-type]
     by_entity = {r["entity_id"]: r for r in rows if r["kind"] == "containment"}
     assert by_entity["e1"]["created"] is True
     assert by_entity["e2"]["created"] is False
+
+
+def test_entity_row_records_the_minted_type_not_the_linker_kind():
+    """C1: delete_actor dispatches on the entity row's entity_type, so it must
+    be the platform type create_missing minted, never linker.entity_kind."""
+    cfg = Config()
+    minted = item(entity_id="e1", entity_name="WaterPlum", created=True, entity_type="Threat-Actor-Group")
+    _, log = logs()
+    rows = pipeline.apply_containment(FakeClient(), [minted], log, ACTOR, cfg, dry_run=False)
+    assert [r for r in rows if r["kind"] == "entity"] == [
+        {"kind": "entity", "entity_id": "e1", "entity_type": "Threat-Actor-Group", "name": "WaterPlum"}
+    ]
+
+
+def test_created_item_without_minted_type_is_refused_before_writing():
+    client = FakeClient()
+    _, log = logs()
+    with pytest.raises(OpenCTIError):
+        pipeline.apply_containment(client, [item(created=True)], log, ACTOR, Config(), dry_run=False)
+    assert client.added_objects == []
+
+
+def test_purge_retains_still_owned_rows_only():
+    """I8: 'still referenced' and 'delete failed' stay ours (retained);
+    'no longer labelled' is adopted and 'already gone' is neither."""
+
+    class Mixed(FakeClient):
+        def delete_actor(self, _entity_type: str, _entity_id: str) -> None:
+            raise OpenCTIError("boom")
+
+    client = Mixed(
+        labels={"ref": [LABEL], "fail": [LABEL], "adopt": ["other"]},
+        ref_counts={"ref": (0, 3), "fail": (0, 0), "adopt": (0, 0)},
+    )
+    rows = [erow("ref"), erow("fail"), erow("adopt"), erow("gone")]
+    types = dict.fromkeys(("ref", "fail", "adopt", "gone"), "Intrusion-Set")
+    retain: list[dict[str, Any]] = []
+    _, log = logs()
+    result = pipeline.purge_created(
+        client, rows, log, dry_run=False, label=LABEL, entity_types=types, retain=retain
+    )
+    assert result == (0, 3)
+    assert [r["entity_id"] for r in retain] == ["ref", "fail"]
+
+
+def test_revert_containment_retains_failed_rows():
+    class Failing(FakeClient):
+        def remove_object_from_report(self, report_id: str, object_id: str) -> None:
+            if object_id == "bad":
+                raise OpenCTIError("transient")
+            super().remove_object_from_report(report_id, object_id)
+
+    rows = [crow("ok", created=False), crow("bad", created=False)]
+    retain: list[dict[str, Any]] = []
+    _, log = logs()
+    assert pipeline.revert_containment(Failing(), rows, log, retain=retain) == 1
+    assert retain == [rows[1]]
