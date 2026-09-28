@@ -101,6 +101,12 @@ CREATE_M = """mutation($input: StixCoreRelationshipAddInput!) {
 
 DELETE_M = """mutation($id: ID!) { stixCoreRelationshipEdit(id: $id) { delete } }"""
 
+REPORT_OBJECT_IDS_Q = """query($id: String!, $after: ID) { report(id: $id) {
+  objects(first: 500, after: $after) {
+    pageInfo { endCursor hasNextPage }
+    edges { node { ... on BasicObject { id } ... on BasicRelationship { id } } }
+  } } }"""
+
 REPORT_ACTORS_Q = """query($id: String!) { report(id: $id) {
   id name published
   objects(first: 500, types: ["Intrusion-Set", "Threat-Actor-Group"]) { edges { node {
@@ -223,6 +229,28 @@ class Client:
           } } }
         } }"""
         return cast("JsonDict", self.gql(q, {"id": report_id})["report"])
+
+    def report_object_ids(self, report_id: str) -> set[str]:
+        """Every object id the report already contains, walked to the end.
+
+        Paginated rather than a single `first: 500` read: containment apply
+        uses this to decide whether a ref is ours, and a truncated read would
+        stamp a vendor's ref as ours -- which revert would then strip.
+        """
+        if not report_id:
+            raise OpenCTIError("report_object_ids() needs a report id")
+        ids: set[str] = set()
+        after: str | None = None
+        for _page in range(MAX_PAGES):
+            report = self.gql(REPORT_OBJECT_IDS_Q, {"id": report_id, "after": after})["report"]
+            if report is None:
+                raise OpenCTIError(f"report {report_id} not found")
+            conn = report["objects"]
+            ids.update(str(e["node"]["id"]) for e in conn["edges"] if (e.get("node") or {}).get("id"))
+            if not conn["pageInfo"]["hasNextPage"]:
+                return ids
+            after = conn["pageInfo"]["endCursor"]
+        raise OpenCTIError(f"report {report_id} objects exceeded {MAX_PAGES} pages")
 
     LOCATIONS_Q = """
     query($after: ID) {

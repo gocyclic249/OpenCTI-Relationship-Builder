@@ -28,17 +28,25 @@ RowKey = tuple[str, ...]
 
 def containment_row(  # noqa: PLR0913 - named ledger fields, not a data clump
     *, report_id: str, entity_id: str, entity_name: str, linker: str, key: str, role: str,
-    confidence: str, evidence: str, label_id: str | None, created: bool,
+    confidence: str, evidence: str, label_id: str | None, created: bool, preexisted: bool = False,
 ) -> JsonDict:
     """A report-contains-entity row (ported octigeo pipeline's per-target record,
-    recast as one ledger kind)."""
+    recast as one ledger kind).
+
+    `preexisted` is True when the entity was already among the report's
+    objects before this run touched it: the ref is not ours, and revert must
+    leave it. Rows written before the field existed carry no key and are
+    read as False (ours) -- the only behaviour those runs ever had. On a
+    re-apply the prior row wins (`_merge_dedupe_prior_wins`), so a ref this
+    run added is never re-stamped preexisted by the second read.
+    """
     if not report_id or not entity_id:
         raise ValueError("containment row needs report_id and entity_id")
     row: JsonDict = {
         "kind": "containment", "report_id": report_id, "entity_id": entity_id,
         "entity_name": entity_name, "linker": linker, "key": key, "role": role,
         "confidence": confidence, "evidence": evidence, "label_id": label_id,
-        "created": bool(created),
+        "created": bool(created), "preexisted": bool(preexisted),
     }
     row_key(row)
     return row

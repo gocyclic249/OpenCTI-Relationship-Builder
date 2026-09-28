@@ -192,3 +192,31 @@ def test_entity_aliases_needs_an_id(fake_gql_client):
     with pytest.raises(ValueError):
         client.entity_aliases("")
     assert calls == []
+
+
+# -- report_object_ids (C2: containment pre-existence read) --------------------
+
+
+def test_report_object_ids_collects_every_page(fake_gql_client):
+    client, _calls = fake_gql_client({})
+    pages = iter([
+        {"report": {"objects": {"pageInfo": {"endCursor": "c1", "hasNextPage": True},
+                                "edges": [{"node": {"id": "a"}}, {"node": {}}]}}},
+        {"report": {"objects": {"pageInfo": {"endCursor": None, "hasNextPage": False},
+                                "edges": [{"node": {"id": "b"}}, {"node": None}]}}},
+    ])
+    sent: list[object] = []
+
+    def paged(_query, variables=None):
+        sent.append(variables)
+        return next(pages)
+
+    client.gql = paged
+    assert client.report_object_ids("r1") == {"a", "b"}
+    assert sent == [{"id": "r1", "after": None}, {"id": "r1", "after": "c1"}]
+
+
+def test_report_object_ids_missing_report_raises(fake_gql_client):
+    client, _calls = fake_gql_client({"report": None})
+    with pytest.raises(OpenCTIError):
+        client.report_object_ids("r1")

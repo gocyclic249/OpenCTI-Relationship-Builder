@@ -44,7 +44,7 @@ from __future__ import annotations
 import re
 import urllib.parse
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import date, timedelta
 from typing import Any, Literal, cast
 
@@ -703,95 +703,124 @@ def create_missing(
 # ----------------------------------------------------------------------- apply
 
 
-def _apply_write(  # noqa: PLR0913 - client/rid/entity id/label state/dry_run, not a data clump
-    client: Client, rid: str, entity_id: str, label_id: str | None, labelled: set[str], *, dry_run: bool
-) -> str | None:
-    """Add the object to the report and, once per report, its label.
+Save = Callable[[list[JsonDict]], None]
 
-    Returns the label_id that ended up on this row -- None when dry-run (no
-    client call at all, port of the octigeo pattern) or when this run isn't
-    labelling.
+
+@dataclass
+class _ApplyState:
+    """Per-call state for `apply_containment`, threaded through its helpers.
+
+    `report_objects` caches each report's object ids (one read per report,
+    updated as this run adds refs); `alias_cache` the same for entity
+    aliases. `checkpoint` persists every row finished so far plus the
+    current item's partial rows -- a no-op on dry-run.
     """
-    if dry_run:
+
+    client: Client
+    linker: Linker
+    label_id: str | None
+    log: Log
+    dry_run: bool
+    checkpoint: Save
+    labelled: set[str] = field(default_factory=set)
+    seen_entities: set[str] = field(default_factory=set)
+    alias_cache: dict[str, set[str]] = field(default_factory=dict)
+    report_objects: dict[str, set[str]] = field(default_factory=dict)
+
+
+def _preexisting(state: _ApplyState, rid: str, entity_id: str) -> bool:
+    """Whether `entity_id` is already among report `rid`'s objects.
+
+    The same read in dry-run and real runs (it is read-only), so a dry run
+    predicts the same `preexisted` stamping. Raises OpenCTIError when the
+    report cannot be read -- ownership then cannot be established.
+    """
+    if not rid or not entity_id:
+        raise ValueError("_preexisting needs a report id and an entity id")
+    if rid not in state.report_objects:
+        state.report_objects[rid] = set(state.client.report_object_ids(rid))
+    return entity_id in state.report_objects[rid]
+
+
+def _label_report(state: _ApplyState, rid: str) -> str | None:
+    """Label report `rid` once per run; the label_id the row should carry.
+
+    A failed label write is logged, not raised: the objectRef it follows is
+    already on the platform and its row must still be ledgered.
+    """
+    if state.dry_run or not state.label_id:
         return None
-    client.add_object_to_report(rid, entity_id)
-    if label_id and rid not in labelled:
-        client.add_label_to_report(rid, label_id)
-        labelled.add(rid)
-    return label_id if rid in labelled else None
+    if rid not in state.labelled:
+        try:
+            state.client.add_label_to_report(rid, state.label_id)
+        except OpenCTIError as exc:
+            state.log(f"  ! label {rid}: {exc}"[:200])
+            return None
+        state.labelled.add(rid)
+    return state.label_id
 
 
-def _apply_item_aliases(  # noqa: PLR0913,PLR0917 - client/item/entity id+name/cache/log, not a data clump
-    client: Client,
-    item: JsonDict,
-    entity_id: str,
-    entity_name: str,
-    cache: dict[str, set[str]],
-    log: Log,
-    *,
-    dry_run: bool,
-) -> list[JsonDict]:
-    """Write `item["alias_writes"]` to `entity_id`, returning alias ledger rows.
+def _alias_known(state: _ApplyState, entity_id: str, entity_name: str) -> set[str] | None:
+    """The entity's known aliases (casefolded), read once per entity."""
+    if entity_id not in state.alias_cache:
+        try:
+            state.alias_cache[entity_id] = {a.casefold() for a in state.client.entity_aliases(entity_id)}
+        except OpenCTIError as exc:
+            state.log(f"  ! entity_aliases {entity_name}: {exc}"[:200])
+            return None
+    return state.alias_cache[entity_id]
 
-    `cache` holds each entity's known aliases (casefold-normalised), read
-    once per entity via `client.entity_aliases` and updated as aliases are
-    added within this run, so a second item for the same entity never
-    re-queries. Dry-run makes no client call at all -- port of the octigeo
-    pattern -- and predicts every write as not-preexisting.
+
+def _apply_item_aliases(
+    state: _ApplyState, item: JsonDict, entity_id: str, entity_name: str, emit: Callable[[JsonDict], None]
+) -> None:
+    """Write `item["alias_writes"]` to `entity_id`, emitting alias ledger rows.
+
+    Dry-run makes the same `entity_aliases` read (it is read-only) but no
+    write, so it predicts `preexisted` exactly as the real run records it.
+    Each emitted row is checkpointed by `emit` straight after its write.
     """
     evidence = str(item.get("evidence") or "")
-    aliases = list(item.get("alias_writes") or [])
-    if dry_run:
-        return [
-            ledger.alias_row(
-                entity_id=entity_id, entity_name=entity_name, alias=alias,
-                preexisted=False, evidence=evidence,
-            )
-            for alias in aliases
-        ]
-
-    if entity_id not in cache:
-        try:
-            cache[entity_id] = {a.casefold() for a in client.entity_aliases(entity_id)}
-        except OpenCTIError as exc:
-            log(f"  ! entity_aliases {entity_name}: {exc}"[:200])
-            return []
-    known = cache[entity_id]
-
-    rows: list[JsonDict] = []
+    aliases = [str(a) for a in (item.get("alias_writes") or [])]
+    known = _alias_known(state, entity_id, entity_name)
+    if known is None:
+        return
     for alias in aliases:
-        if alias.casefold() in known:
-            rows.append(ledger.alias_row(
-                entity_id=entity_id, entity_name=entity_name, alias=alias,
-                preexisted=True, evidence=evidence,
-            ))
-            continue
-        try:
-            client.add_entity_alias(entity_id, alias)
-        except OpenCTIError as exc:
-            log(f"  ! alias {alias} -> {entity_name}: {exc}"[:200])
-            continue
+        preexisted = alias.casefold() in known
+        if not preexisted and not state.dry_run:
+            try:
+                state.client.add_entity_alias(entity_id, alias)
+            except OpenCTIError as exc:
+                state.log(f"  ! alias {alias} -> {entity_name}: {exc}"[:200])
+                continue
         known.add(alias.casefold())
-        rows.append(ledger.alias_row(
+        emit(ledger.alias_row(
             entity_id=entity_id, entity_name=entity_name, alias=alias,
-            preexisted=False, evidence=evidence,
+            preexisted=preexisted, evidence=evidence,
         ))
-    return rows
 
 
-def _apply_one(  # noqa: PLR0913,PLR0917 - client/item/linker/label state/alias cache/log, not a data clump
-    client: Client,
-    item: JsonDict,
-    linker: Linker,
-    label_id: str | None,
-    labelled: set[str],
-    seen_entities: set[str],
-    alias_cache: dict[str, set[str]],
-    log: Log,
-    *,
-    dry_run: bool,
-) -> list[JsonDict]:
-    """Apply one approved item: containment row, plus entity/alias rows."""
+def _add_ref(state: _ApplyState, rid: str, entity_id: str, entity_name: str) -> bool | None:
+    """Add the objectRef unless already present. Returns `preexisted`, or
+    None when the report could not be read or the write failed (logged)."""
+    try:
+        preexisted = _preexisting(state, rid, entity_id)
+        if not preexisted and not state.dry_run:
+            state.client.add_object_to_report(rid, entity_id)
+            state.report_objects[rid].add(entity_id)
+    except OpenCTIError as exc:
+        state.log(f"  ! {entity_name} -> {rid}: {exc}"[:200])
+        return None
+    return preexisted
+
+
+def _apply_one(state: _ApplyState, item: JsonDict, prior: list[JsonDict]) -> list[JsonDict]:
+    """Apply one approved item: containment row, plus entity/alias rows.
+
+    A ref already on the report is recorded `preexisted: true` and neither
+    re-added nor labelled -- it is not ours, and revert must leave it. Each
+    row is checkpointed (with `prior`) as soon as its platform write lands.
+    """
     entity_id = str(item.get("entity_id") or "")
     entity_name = str(item.get("entity_name") or entity_id)
     rid = str(item.get("report_id") or "")
@@ -801,32 +830,46 @@ def _apply_one(  # noqa: PLR0913,PLR0917 - client/item/linker/label state/alias 
     if item.get("created") and not created_type:
         raise OpenCTIError(f"created item has no minted entity_type: {str(item)[:160]}")
 
-    try:
-        row_label = _apply_write(client, rid, entity_id, label_id, labelled, dry_run=dry_run)
-    except OpenCTIError as exc:
-        log(f"  ! {entity_name} -> {rid}: {exc}"[:200])
-        return []
+    rows: list[JsonDict] = []
 
-    rows: list[JsonDict] = [ledger.containment_row(
+    def emit(row: JsonDict) -> None:
+        rows.append(row)
+        state.checkpoint([*prior, *rows])
+
+    preexisted = _add_ref(state, rid, entity_id, entity_name)
+    if preexisted is None:
+        return []
+    linker = state.linker
+    containment = ledger.containment_row(
         report_id=rid, entity_id=entity_id, entity_name=entity_name, linker=linker.name,
         key=str(item.get(linker.key_field) or ""), role=str(item.get("role") or ""),
         confidence=str(item.get("confidence") or ""), evidence=str(item.get("evidence") or ""),
-        label_id=row_label, created=bool(item.get("created")),
-    )]
+        label_id=None, created=bool(item.get("created")), preexisted=preexisted,
+    )
+    emit(containment)
+    if not preexisted:
+        containment["label_id"] = _label_report(state, rid)
+        if containment["label_id"]:
+            state.checkpoint([*prior, *rows])
 
-    if item.get("created") and entity_id not in seen_entities:
-        seen_entities.add(entity_id)
-        rows.append(ledger.entity_row(entity_id=entity_id, entity_type=created_type, name=entity_name))
+    if item.get("created") and entity_id not in state.seen_entities:
+        state.seen_entities.add(entity_id)
+        emit(ledger.entity_row(entity_id=entity_id, entity_type=created_type, name=entity_name))
 
     if item.get("alias_writes") and str(item.get("confidence") or "").lower() == AUTO_CONFIDENCE:
-        rows.extend(
-            _apply_item_aliases(client, item, entity_id, entity_name, alias_cache, log, dry_run=dry_run)
-        )
+        _apply_item_aliases(state, item, entity_id, entity_name, emit)
     return rows
 
 
-def apply_containment(  # noqa: PLR0913 - client/approved/log/linker/cfg/dry_run, not a data clump
-    client: Client, approved: list[JsonDict], log: Log, linker: Linker, cfg: Config, *, dry_run: bool
+def apply_containment(  # noqa: PLR0913 - client/approved/log/linker/cfg/dry_run/save, not a data clump
+    client: Client,
+    approved: list[JsonDict],
+    log: Log,
+    linker: Linker,
+    cfg: Config,
+    *,
+    dry_run: bool,
+    save: Save | None = None,
 ) -> list[JsonDict]:
     """Add each resolved entity to its report's objectRefs (containment).
 
@@ -834,23 +877,27 @@ def apply_containment(  # noqa: PLR0913 - client/approved/log/linker/cfg/dry_run
     ledgers newly created entities, so a single `apply_containment` call
     produces every row kind `revert_containment`/`revert_aliases`/
     `purge_created` need to undo this run.
+
+    `save(rows)` (like `writer.apply_items`) is called with every row so
+    far after each platform write, so a crash mid-batch never leaves a
+    write the ledger doesn't own. Never called on dry-run.
     """
     if not isinstance(approved, list):
         raise TypeError("apply_containment: approved must be a list")
     if not isinstance(cfg, Config):
         raise TypeError("apply_containment: cfg must be a Config")
 
-    label = cfg.label(linker.label_suffix)
-    label_id = client.ensure_label(label, cfg.labels.color) if not dry_run else None
+    def checkpoint(rows_so_far: list[JsonDict]) -> None:
+        if save is not None and not dry_run:
+            save(rows_so_far)
 
+    label_id = client.ensure_label(cfg.label(linker.label_suffix), cfg.labels.color) if not dry_run else None
+    state = _ApplyState(client=client, linker=linker, label_id=label_id, log=log,
+                        dry_run=dry_run, checkpoint=checkpoint)
     rows: list[JsonDict] = []
-    labelled: set[str] = set()
-    seen_entities: set[str] = set()
-    alias_cache: dict[str, set[str]] = {}
     for item in approved:
-        rows.extend(_apply_one(
-            client, item, linker, label_id, labelled, seen_entities, alias_cache, log, dry_run=dry_run
-        ))
+        rows.extend(_apply_one(state, item, rows))
+        checkpoint(rows)
 
     if any(not isinstance(r, dict) for r in rows):
         raise RuntimeError("apply_containment produced a non-dict row")
@@ -885,6 +932,9 @@ def revert_containment(
         rid = str(row.get("report_id") or "")
         if not entity_id or not rid:
             raise OpenCTIError(f"containment row has no entity/report id: {str(row)[:160]}")
+        if row.get("preexisted"):  # absent (pre-field rows) reads as ours
+            log(f"  keep {entity_name} in {rid} (pre-existed)")
+            continue
         if dry_run:
             log(f"  would remove {entity_name} from {rid}")
             reverted += 1

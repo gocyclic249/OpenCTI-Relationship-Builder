@@ -288,7 +288,12 @@ class ContainmentFakeClient:
         self.labels_ensured.append((value, color))
         return f"label-{value}"
 
+    def report_object_ids(self, report_id: str) -> set[str]:
+        return set()
+
     def add_object_to_report(self, report_id: str, object_id: str) -> None:
+        if object_id == "e-crash":
+            raise KeyboardInterrupt
         self.added_objects.append((report_id, object_id))
 
     def add_label_to_report(self, report_id: str, label_id: str) -> None:
@@ -327,6 +332,24 @@ def test_apply_containment_merges_ledger(tmp_path: Path, monkeypatch: pytest.Mon
     applied = json.loads((run_dir / "applied.json").read_text())
     assert applied[0]["entity_id"] == "e1"
     assert fake.added_objects == [("r1", "e1")]
+
+
+def test_apply_containment_checkpoints_mid_batch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """I1: a batch that dies partway leaves applied.json owning every write
+    that already reached the platform."""
+    run_dir = tmp_path / "r1"
+    write_meta(run_dir, linker="report-location")
+    base = {"report_id": "r1", "iso3": "FRA", "role": "target", "confidence": "high", "evidence": "q"}
+    auto = [dict(base, entity_id="e1", entity_name="France"), dict(base, entity_id="e-crash", entity_name="X")]
+    (run_dir / "auto.json").write_text(json.dumps(auto))
+    cfg = make_cfg(tmp_path)
+    monkeypatch.setattr(cli, "_load_cfg", lambda _args: cfg)
+    monkeypatch.setattr(cli, "_client", lambda _cfg: ContainmentFakeClient())
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.cmd_apply(ns(run_id="r1"))
+    applied = json.loads((run_dir / "applied.json").read_text())
+    assert [r["entity_id"] for r in applied] == ["e1"]
 
 
 # ------------------------------------------------------------------- revert

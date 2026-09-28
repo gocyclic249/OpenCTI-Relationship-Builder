@@ -297,8 +297,14 @@ def _apply_containment_cmd(
     if args.create_missing:
         resolver = linker.build_resolver(client, cfg)
         approved += pipeline.create_missing(resolver, review, _log, dry_run=args.dry_run, linker=linker)
-    rows = pipeline.apply_containment(client, approved, _log, linker, cfg, dry_run=args.dry_run)
     prior = run.read_json("applied.json") if run.has("applied.json") else []
+
+    def save(fresh: list[JsonDict]) -> None:
+        run.write_json("applied.json", ledger.merge_ledger(prior, fresh))
+
+    rows = pipeline.apply_containment(
+        client, approved, _log, linker, cfg, dry_run=args.dry_run, save=save
+    )
     merged = ledger.merge_ledger(prior, rows)
     if not args.dry_run:
         run.write_json("applied.json", merged)

@@ -81,7 +81,10 @@ class FakeClient:
         aliases: dict[str, list[str]] | None = None,
         labels: dict[str, list[str]] | None = None,
         ref_counts: dict[str, tuple[int, int]] | None = None,
+        report_objects: dict[str, set[str]] | None = None,
     ) -> None:
+        self.report_objects = {k: set(v) for k, v in (report_objects or {}).items()}
+        self.object_reads: list[str] = []
         self._aliases = {k: list(v) for k, v in (aliases or {}).items()}
         self._labels = labels or {}
         self._ref_counts = ref_counts or {}
@@ -98,6 +101,10 @@ class FakeClient:
     def ensure_label(self, value: str, color: str) -> str:
         self.labels_ensured.append((value, color))
         return f"label-{value}"
+
+    def report_object_ids(self, report_id: str) -> set[str]:
+        self.object_reads.append(report_id)
+        return set(self.report_objects.get(report_id, set()))
 
     def add_object_to_report(self, report_id: str, object_id: str) -> None:
         self.added_objects.append((report_id, object_id))
@@ -377,7 +384,7 @@ def test_apply_stamps_the_created_flag_onto_the_ledger():
     minted = item(entity_id="e1", entity_name="WaterPlum", created=True, entity_type="Intrusion-Set")
     ordinary = item(report_id="r2", entity_id="e2", entity_name="SaltTyphoon", created=False)
     _, log = logs()
-    rows = pipeline.apply_containment(None, [minted, ordinary], log, ACTOR, cfg, dry_run=True)  # type: ignore[arg-type]
+    rows = pipeline.apply_containment(FakeClient(), [minted, ordinary], log, ACTOR, cfg, dry_run=True)  # type: ignore[arg-type]
     by_entity = {r["entity_id"]: r for r in rows if r["kind"] == "containment"}
     assert by_entity["e1"]["created"] is True
     assert by_entity["e2"]["created"] is False
@@ -438,3 +445,146 @@ def test_revert_containment_retains_failed_rows():
     _, log = logs()
     assert pipeline.revert_containment(Failing(), rows, log, retain=retain) == 1
     assert retain == [rows[1]]
+
+
+# ------------------------------------------- C2: containment pre-existence
+
+
+def test_preexisting_object_is_stamped_and_not_readded():
+    """C2: an entity already on the report is not ours -- no add, no label,
+    and the row says so, so revert leaves it alone."""
+    client = FakeClient(report_objects={"r1": {"e1"}})
+    _, log = logs()
+    rows = pipeline.apply_containment(client, [item()], log, LOCATION, Config(), dry_run=False)
+    assert client.added_objects == []
+    assert client.added_labels == []
+    assert rows[0]["preexisted"] is True
+    assert rows[0]["label_id"] is None
+
+
+def test_fresh_object_is_stamped_not_preexisted():
+    client = FakeClient(report_objects={"r1": {"other"}})
+    _, log = logs()
+    rows = pipeline.apply_containment(client, [item()], log, LOCATION, Config(), dry_run=False)
+    assert client.added_objects == [("r1", "e1")]
+    assert rows[0]["preexisted"] is False
+
+
+def test_report_objects_read_once_per_report():
+    client = FakeClient()
+    _, log = logs()
+    approved = [item(entity_id="e1"), item(entity_id="e2"), item(report_id="r2", entity_id="e1")]
+    pipeline.apply_containment(client, approved, log, LOCATION, Config(), dry_run=False)
+    assert client.object_reads == ["r1", "r2"]
+
+
+def test_dry_run_predicts_preexistence_identically():
+    """Dry-run parity: the same read, so the same stamping."""
+    approved = [item(entity_id="e1"), item(entity_id="e2")]
+    _, log = logs()
+    dry = pipeline.apply_containment(
+        FakeClient(report_objects={"r1": {"e1"}}), approved, log, LOCATION, Config(), dry_run=True
+    )
+    real = pipeline.apply_containment(
+        FakeClient(report_objects={"r1": {"e1"}}), approved, log, LOCATION, Config(), dry_run=False
+    )
+    assert [r["preexisted"] for r in dry] == [r["preexisted"] for r in real] == [True, False]
+
+
+def test_unreadable_report_objects_skip_the_item():
+    """Ownership cannot be established, so nothing is written or ledgered."""
+
+    class Unreadable(FakeClient):
+        def report_object_ids(self, _report_id: str) -> set[str]:
+            raise OpenCTIError("unreachable")
+
+    client = Unreadable()
+    sink, log = logs()
+    rows = pipeline.apply_containment(client, [item()], log, LOCATION, Config(), dry_run=False)
+    assert rows == []
+    assert client.added_objects == []
+    assert any("r1" in line for line in sink)
+
+
+def test_revert_skips_preexisted_containment_rows():
+    client = FakeClient()
+    sink, log = logs()
+    pre = ledger.containment_row(
+        report_id="r1", entity_id="e-pre", entity_name="Vendor ref", linker="report-location",
+        key="k", role="target", confidence="high", evidence="q", label_id=None, created=False,
+        preexisted=True,
+    )
+    fresh = crow("e-new", created=False)
+    retain: list[dict[str, Any]] = []
+    assert pipeline.revert_containment(client, [pre, fresh], log, retain=retain) == 1
+    assert client.removed_objects == [("r1", "e-new")]
+    assert retain == []
+    assert any("keep" in line and "pre-existed" in line for line in sink)
+
+
+def test_revert_treats_a_row_without_preexisted_as_ours():
+    """Rows written before the field existed carry no key: treated as ours."""
+    legacy = crow("e1", created=False)
+    del legacy["preexisted"]
+    client = FakeClient()
+    _, log = logs()
+    assert pipeline.revert_containment(client, [legacy], log) == 1
+    assert client.removed_objects == [("r1", "e1")]
+
+
+# ------------------------------------------------ I1: containment checkpoints
+
+
+def test_apply_checkpoints_after_each_write():
+    """A crash mid-batch leaves the saved ledger owning every write so far."""
+
+    class Crashes(FakeClient):
+        def add_object_to_report(self, report_id: str, object_id: str) -> None:
+            if object_id == "e2":
+                raise KeyboardInterrupt
+            super().add_object_to_report(report_id, object_id)
+
+    saved: list[list[dict[str, Any]]] = []
+    _, log = logs()
+    approved = [item(entity_id="e1"), item(entity_id="e2")]
+    with pytest.raises(KeyboardInterrupt):
+        pipeline.apply_containment(
+            Crashes(), approved, log, LOCATION, Config(), dry_run=False, save=saved.append
+        )
+    assert [r["entity_id"] for r in saved[-1]] == ["e1"]
+
+
+def test_label_failure_after_object_add_still_ledgers_the_row():
+    """The objectRef is on the platform; the ledger must own it even though
+    the label write that followed failed."""
+
+    class LabelFails(FakeClient):
+        def add_label_to_report(self, _report_id: str, _label_id: str) -> None:
+            raise OpenCTIError("label boom")
+
+    client = LabelFails()
+    _, log = logs()
+    rows = pipeline.apply_containment(client, [item()], log, LOCATION, Config(), dry_run=False)
+    assert client.added_objects == [("r1", "e1")]
+    assert [(r["entity_id"], r["label_id"]) for r in rows] == [("e1", None)]
+
+
+def test_dry_run_never_saves():
+    saved: list[Any] = []
+    _, log = logs()
+    pipeline.apply_containment(FakeClient(), [item()], log, LOCATION, Config(), dry_run=True, save=saved.append)
+    assert saved == []
+
+
+def test_dry_run_alias_prediction_reads_existing_aliases():
+    """Dry-run parity for alias write-back: an alias already on the entity is
+    predicted pre-existing, exactly as the real run will record it."""
+    client = FakeClient(aliases={"e1": ["ICE RELIC"]})
+    _, log = logs()
+    rows = pipeline.apply_containment(
+        client, [item(alias_writes=["ICE RELIC", "NEW"])], log, ACTOR, Config(), dry_run=True
+    )
+    assert [(r["alias"], r["preexisted"]) for r in rows if r["kind"] == "alias"] == [
+        ("ICE RELIC", True), ("NEW", False)
+    ]
+    assert client.added_aliases == []
