@@ -291,6 +291,14 @@ def test_select_description_rejects_bad_limit():
         select_description(FakeActorClient([]), 0)
 
 
+def test_select_description_rejects_non_list_actors():
+    """Ported from test_rel_sources.py's test_description_packets_rejects_non_list_actors:
+    select_description still guards client.actors() the same way
+    description_packets guarded its pre-fetched `actors` parameter."""
+    with pytest.raises(TypeError, match=r"client\.actors\(\) must return a list"):
+        select_description(FakeActorClient("not a list"), None)  # type: ignore[arg-type]
+
+
 class FakeReportClient:
     """report_actors ONLY -- any other attribute access proves select_report
     tried an outbound fetch, which the report source must never do."""
