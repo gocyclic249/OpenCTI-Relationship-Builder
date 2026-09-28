@@ -38,11 +38,25 @@ class Run:
         return self.root / name
 
     def write_json(self, name: str, data: Any) -> Path:
-        """Write data as JSON to a file in this run."""
+        """Write data as JSON to a file in this run, atomically.
+
+        Written to a sibling `.tmp` then `Path.replace()`d over the target
+        (same pattern as `crosswalk.refresh`): apply checkpoints applied.json
+        after every platform write, so a kill mid-write must leave the prior
+        ledger intact, never a torn file that makes the run unrevertable.
+        A failed write removes its `.tmp` and re-raises.
+        """
         if not isinstance(name, str):
             raise TypeError("name must be str")
         p = self._path(name)
-        p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp = p.with_name(p.name + ".tmp")
+        try:
+            tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(p)
+        finally:
+            tmp.unlink(missing_ok=True)
+        if not p.is_file():
+            raise OSError(f"write_json: {p} missing after replace")
         return p
 
     def read_json(self, name: str) -> Any:

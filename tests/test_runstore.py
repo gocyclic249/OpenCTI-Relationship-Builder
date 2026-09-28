@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -59,3 +60,26 @@ def test_text_cache_rejects_traversal(tmp_path):
 
 def test_new_run_id_shape():
     assert len(new_run_id()) == 16 and new_run_id().endswith("Z")
+
+
+def test_write_json_is_atomic(tmp_path, monkeypatch):
+    """A write that dies partway must leave the previous file intact -- the
+    checkpoint ledger (applied.json) is rewritten after every platform write,
+    and a torn file would make the run unrevertable."""
+    run = Run(tmp_path / "r1")
+    run.write_json("applied.json", [{"kind": "containment", "n": 1}])
+    assert list(run.root.glob("*.tmp")) == []
+
+    real_write_text = Path.write_text
+
+    def torn(self, text, *args, **kwargs):
+        real_write_text(self, text[: len(text) // 2], *args, **kwargs)
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Path, "write_text", torn)
+    with pytest.raises(OSError):
+        run.write_json("applied.json", [{"kind": "containment", "n": 1}, {"kind": "containment", "n": 2}])
+    monkeypatch.undo()
+
+    assert run.read_json("applied.json") == [{"kind": "containment", "n": 1}]
+    assert list(run.root.glob("*.tmp")) == []
