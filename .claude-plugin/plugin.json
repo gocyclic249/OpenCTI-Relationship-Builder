@@ -1,0 +1,6 @@
+{
+  "name": "opencti-relationship-builder",
+  "version": "0.1.0",
+  "description": "Enrich OpenCTI relationships: link reports to locations, sectors, actors and CVEs, and build actor targeting relationships, with review queues and full revert.",
+  "author": { "name": "gocyclic249" }
+}

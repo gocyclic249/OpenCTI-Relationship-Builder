@@ -1,0 +1,11 @@
+{
+  "name": "opencti-relationship-builder",
+  "owner": { "name": "gocyclic249" },
+  "plugins": [
+    {
+      "name": "opencti-relationship-builder",
+      "source": "./",
+      "description": "OpenCTI relationship enrichment skills and CLI"
+    }
+  ]
+}
