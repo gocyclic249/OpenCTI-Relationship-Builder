@@ -94,30 +94,40 @@ class Run:
             try:
                 meta_path = d / "meta.json"
                 if not meta_path.is_file():
-                    continue  # not a run
+                    continue  # why: no meta.json means it's not a run directory
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                created = meta.get("created")
+                created = meta["created"]  # raises KeyError if absent
                 if not isinstance(created, str):
-                    continue  # not a run
+                    continue  # why: created must be ISO 8601 timestamp string
                 if latest_created is None or created > latest_created:
                     latest_created = created
                     latest_run = Run(d)
             except (OSError, json.JSONDecodeError, KeyError):
-                continue  # not a run
+                continue  # why: anything unreadable here is by definition not a run directory
 
         return latest_run
 
     @staticmethod
-    def open(runs_dir: Path, run_id: str) -> Run:
-        """Open a specific run by ID or exit if not found."""
+    def open(runs_dir: Path, run_id: str | None) -> Run:
+        """Open a specific run by ID, or latest if run_id is None.
+
+        Raises SystemExit if no runs found.
+        """
         if not isinstance(runs_dir, Path):
             raise TypeError("runs_dir must be a Path")
-        if not isinstance(run_id, str):
-            raise TypeError("run_id must be str")
-        root = runs_dir / run_id
-        if not root.is_dir():
-            raise SystemExit(f"No such run: {root}")
-        return Run(root)
+        if run_id is not None and not isinstance(run_id, str):
+            raise TypeError("run_id must be str or None")
+
+        if run_id:
+            root = runs_dir / run_id
+            if not root.is_dir():
+                raise SystemExit(f"No such run: {root}")
+            return Run(root)
+
+        run = Run.latest(runs_dir)
+        if run is None:
+            raise SystemExit(f"No runs found in {runs_dir} — start with `select`.")
+        return run
 
 
 class TextCache:

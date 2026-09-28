@@ -37,6 +37,13 @@ def test_linker_from_meta(tmp_path):
     assert Run.open(tmp_path, "r1").linker() == "report-location"
 
 
+def test_open_none_returns_latest(tmp_path):
+    make_run(tmp_path, "old", "2026-01-01T00:00:00Z")
+    make_run(tmp_path, "new", "2026-09-01T00:00:00Z")
+    run = Run.open(tmp_path, None)
+    assert run.run_id == "new"
+
+
 def test_text_cache_roundtrip(tmp_path):
     cache = TextCache(tmp_path)
     assert cache.read("rep-1") is None
