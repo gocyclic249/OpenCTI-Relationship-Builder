@@ -1,6 +1,9 @@
 {
   "name": "opencti-relationship-builder",
-  "owner": { "name": "gocyclic249" },
+  "description": "OpenCTI relationship enrichment: link reports to locations, sectors, actors and CVEs, and build actor targeting relationships, with review queues and full revert.",
+  "owner": {
+    "name": "gocyclic249"
+  },
   "plugins": [
     {
       "name": "opencti-relationship-builder",
