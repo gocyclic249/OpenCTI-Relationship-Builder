@@ -34,6 +34,7 @@ VALID_CREATE_MISSING_TYPES = frozenset({"Intrusion-Set", "Threat-Actor-Group"})
 MAX_DISK_PATHS = 1000
 PERCENT_SCALE = 100
 BYTES_PER_GB = 1024**3
+HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
 # -- sub-configs -------------------------------------------------------------
@@ -101,6 +102,12 @@ class VulnsCfg:
 
 
 @dataclass(frozen=True)
+class ReportLabelsCfg:
+    enabled: bool = True
+    color: str = "#5b6abf"
+
+
+@dataclass(frozen=True)
 class Config:
     platform: PlatformCfg = field(default_factory=PlatformCfg)
     runs: RunsCfg = field(default_factory=RunsCfg)
@@ -111,6 +118,7 @@ class Config:
     sectors: SectorsCfg = field(default_factory=SectorsCfg)
     actors: ActorsCfg = field(default_factory=ActorsCfg)
     vulns: VulnsCfg = field(default_factory=VulnsCfg)
+    report_labels: ReportLabelsCfg = field(default_factory=ReportLabelsCfg)
 
     @property
     def runs_dir(self) -> Path:
@@ -206,6 +214,7 @@ SCHEMA: dict[str, dict[str, type | tuple[type, ...]]] = {
         "alias_writeback": bool,
     },
     "vulns": {"enabled": bool},
+    "report_labels": {"enabled": bool, "color": str},
 }
 
 
@@ -322,6 +331,13 @@ def _build_labels(table: dict[str, Any]) -> LabelsCfg:
     return cfg
 
 
+def _build_report_labels(table: dict[str, Any]) -> ReportLabelsCfg:
+    cfg = ReportLabelsCfg(**table)
+    if not HEX_COLOR_RE.match(cfg.color):
+        raise SystemExit(f"config: [report_labels].color must be #RRGGBB (got {cfg.color!r})")
+    return cfg
+
+
 def _build_config(data: dict[str, Any]) -> Config:
     _validate_schema(data)
     return Config(
@@ -334,6 +350,7 @@ def _build_config(data: dict[str, Any]) -> Config:
         sectors=_build_sectors(data.get("sectors", {})),
         actors=_build_actors(data.get("actors", {})),
         vulns=VulnsCfg(**data.get("vulns", {})),
+        report_labels=_build_report_labels(data.get("report_labels", {})),
     )
 
 
