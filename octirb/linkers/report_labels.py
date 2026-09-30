@@ -226,7 +226,8 @@ def _problems(item: Any, selection_ids: set[str]) -> list[str]:
     label = item.get("label")
     if not isinstance(label, str) or not label.strip():
         reasons.append("label is empty or not a string")
-    if item.get("from") not in ledger.LABEL_SOURCES:
+    src = item.get("from")
+    if not isinstance(src, str) or src not in ledger.LABEL_SOURCES:
         reasons.append(f"from must be one of {sorted(ledger.LABEL_SOURCES)}")
     return reasons
 

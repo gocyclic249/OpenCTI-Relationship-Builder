@@ -237,6 +237,7 @@ def test_validate_good_items_auto():
 
 @pytest.mark.parametrize("bad", [
     ext(report_id="elsewhere"), ext(label=""), ext(label=None), ext(**{"from": "region"}),
+    ext(**{"from": ["country"]}), ext(**{"from": {}}),
 ])
 def test_validate_bad_items_hard_fail(bad):
     auto, review = validate([bad], {"r1"})
