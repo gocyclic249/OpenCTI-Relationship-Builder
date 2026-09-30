@@ -190,6 +190,14 @@ def test_select_rejects_bad_limit():
         select(SelectFake([]), Config(), log, limit=0, since=None)
 
 
+def test_select_ignores_config_since_days():
+    """No explicit `since` backfills the whole corpus, ignoring [selection].since_days."""
+    cfg = Config(selection=SelectionCfg(since_days=183))
+    _lines, log = logs()
+    got = select(SelectFake([node("old", published="2020-01-01")]), cfg, log, limit=None, since=None)
+    assert [g["report_id"] for g in got] == ["old"]
+
+
 class BatchFake:
     def __init__(self, reports: dict[str, dict[str, Any]]) -> None:
         self._reports = reports

@@ -164,19 +164,18 @@ def select(
 
     Unlike `pipeline.select`, a report with no text is kept -- labels need
     none -- and no text tier is planned. Source/title/since gates are the
-    shared `pipeline.basic_skip`.
+    shared `pipeline.basic_skip`. Unlike other linkers, ignores
+    `[selection].since_days` — no `since` means the whole corpus (the backfill);
+    callers pass `since` for incremental runs.
     """
     if limit is not None and limit <= 0:
         raise ValueError("select: limit must be a positive int or None")
     sel = cfg.selection
     title_res = tuple(re.compile(p, re.IGNORECASE) for p in sel.exclude_title_patterns)
-    since_value = since
-    if since_value is None and sel.since_days > 0:
-        since_value = pipeline.since_from_days(sel.since_days)
     counts = {"old": 0, "excluded_source": 0, "excluded_title": 0, "empty": 0}
     out: list[JsonDict] = []
     for node in client.reports():
-        if pipeline.basic_skip(node, since=since_value, empty_only=False, sel=sel,
+        if pipeline.basic_skip(node, since=since, empty_only=False, sel=sel,
                                title_res=title_res, counts=counts):
             continue
         if not node["objects"]["edges"]:

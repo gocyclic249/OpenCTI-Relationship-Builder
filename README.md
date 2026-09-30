@@ -107,7 +107,7 @@ dependencies.
    `select` skips the reports the first one enriched. Use `--all-reports`
    for a second linker pass over the same corpus.
 
-3. **Fetch** article text into the shared cache (report-* linkers only):
+3. **Fetch** article text into the shared cache (report-* linkers only; `report-labels` skips this):
 
    ```
    bin/octi-rb fetch
