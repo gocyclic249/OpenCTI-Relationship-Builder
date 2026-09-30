@@ -349,19 +349,52 @@ def test_sector_parents_shape(fake_gql_client):
 
 
 def test_find_label_prefers_exact_then_casefold(fake_gql_client):
-    client, _calls = fake_gql_client({"labels": {"edges": [
-        {"node": {"id": "L-lower", "value": "ics"}},
-        {"node": {"id": "L-exact", "value": "ICS"}},
-    ]}})
+    client, _calls = fake_gql_client({"labels": {
+        "pageInfo": {"endCursor": None, "hasNextPage": False},
+        "edges": [
+            {"node": {"id": "L-lower", "value": "ics"}},
+            {"node": {"id": "L-exact", "value": "ICS"}},
+        ],
+    }})
     assert client.find_label("ICS") == "L-exact"
     assert client.find_label("Ics") == "L-lower"
 
 
 def test_find_label_absent_and_substring_only(fake_gql_client):
-    client, _calls = fake_gql_client({"labels": {"edges": [
-        {"node": {"id": "L1", "value": "octi-geo-ics"}},
-    ]}})
+    client, _calls = fake_gql_client({"labels": {
+        "pageInfo": {"endCursor": None, "hasNextPage": False},
+        "edges": [
+            {"node": {"id": "L1", "value": "octi-geo-ics"}},
+        ],
+    }})
     assert client.find_label("ICS") is None
+
+
+def test_find_label_casefold_match_on_page_2(fake_gql_client):
+    client, _calls = fake_gql_client({})
+    pages = iter([
+        {"labels": {
+            "pageInfo": {"endCursor": "k1", "hasNextPage": True},
+            "edges": [
+                {"node": {"id": "L1", "value": "other-label"}},
+            ],
+        }},
+        {"labels": {
+            "pageInfo": {"endCursor": None, "hasNextPage": False},
+            "edges": [
+                {"node": {"id": "L-fold", "value": "ics"}},
+            ],
+        }},
+    ])
+    sent = []
+
+    def paged(_query, variables=None):
+        sent.append(variables)
+        return next(pages)
+
+    client.gql = paged
+    assert client.find_label("ICS") == "L-fold"
+    assert sent == [{"s": "ICS", "after": None}, {"s": "ICS", "after": "k1"}]
 
 
 def test_find_label_needs_a_value(fake_gql_client):

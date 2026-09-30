@@ -129,7 +129,8 @@ SECTOR_PARENTS_Q = """query($after: ID) { sectors(first: 500, after: $after) {
   edges { node { id name parentSectors { edges { node { id } } } } }
 } }"""
 
-FIND_LABEL_Q = """query($s: String) { labels(first: 100, search: $s) {
+FIND_LABEL_Q = """query($s: String, $after: ID) { labels(first: 100, search: $s, after: $after) {
+  pageInfo { endCursor hasNextPage }
   edges { node { id value } } } }"""
 
 LABEL_SOURCE_TYPES = frozenset({"Country", "Sector"})
@@ -388,26 +389,25 @@ class Client:
 
     def sector_parents(self) -> list[JsonDict]:
         """Every platform sector (any author) with its parent sector ids."""
-        rows = [
-            {
+        rows: list[JsonDict] = []
+        for n in self.paginate(SECTOR_PARENTS_Q, "sectors"):
+            if not n.get("id"):
+                raise OpenCTIError("sector_parents: a sector came back without an id")
+            rows.append({
                 "id": str(n["id"]), "name": str(n["name"]),
                 "parent_ids": [str(e["node"]["id"]) for e in (n.get("parentSectors") or {}).get("edges", [])],
-            }
-            for n in self.paginate(SECTOR_PARENTS_Q, "sectors")
-        ]
-        if any(not r["id"] for r in rows):
-            raise OpenCTIError("sector_parents: a sector came back without an id")
+            })
         return rows
 
     def find_label(self, value: str) -> str | None:
         """Id of the label equal to `value` ignoring case, exact case preferred.
 
         `labels(search:)` is a fuzzy match, so every hit is re-checked here --
-        `octi-geo-ics` must not stand in for `ICS`.
+        `octi-geo-ics` must not stand in for `ICS`. Paginated to handle >100 matches.
         """
         if not value.strip():
             raise OpenCTIError("find_label() needs a value")
-        nodes = [e["node"] for e in self.gql(FIND_LABEL_Q, {"s": value})["labels"]["edges"]]
+        nodes = list(self.paginate(FIND_LABEL_Q, "labels", {"s": value}))
         exact = [n for n in nodes if n["value"] == value]
         folded = [n for n in nodes if str(n["value"]).casefold() == value.casefold()]
         for node in [*exact, *folded]:
