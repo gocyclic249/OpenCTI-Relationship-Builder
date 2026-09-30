@@ -114,7 +114,7 @@ dependencies.
    ```
 
 4. **Batch.** Writes `batch.json` and `CONTRACT.md` for the model step
-   (`report-vuln` skips this — it's deterministic and writes
+   (`report-vuln` and `report-labels` skip this — they're deterministic and write
    `extractions.json` directly):
 
    ```
@@ -169,7 +169,17 @@ scoped to a single run.
 | `report-sector` | Report → Sector | containment | yes — canonical names only |
 | `report-actor` | Report → Intrusion-Set / Threat-Actor-Group | containment | yes — full alias chains |
 | `report-vuln` | Report → Vulnerability | containment | no — regex + exact lookup |
+| `report-labels` | Report → plain labels | label | no — country names + top-level sector roots |
 | `actor-target` | Actor → Country / Region / Sector | relationship (`targets` / origin) | yes — evidence pairs |
+
+`report-labels` labels each report with the **unprefixed** name of every
+Country it contains and of every top-level root above every Sector it
+contains (a sector with two parents gives both roots). It reads everything a
+report contains, whoever added it, so running it with no `--since-days`
+backfills the whole corpus; `--since-days N` keeps scheduled runs
+incremental. It is add-only — `revert` removes only labels its run added,
+never one already on the report — and it has no fetch or model step:
+`select`, `batch`, `validate`, `apply`.
 
 `report-vuln` never guesses at an unresolved CVE ID — with NVD feeds
 present on most platforms, an unrecognized ID is more likely wrong than
