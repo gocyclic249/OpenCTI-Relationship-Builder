@@ -17,10 +17,10 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
-from .. import pipeline
+from .. import ledger, pipeline
 from ..client import JsonDict, OpenCTIError
 
 if TYPE_CHECKING:
@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from ..config import Config
 
 Log = Callable[[str], None]
+Save = Callable[[list[JsonDict]], None]
 
 
 @dataclass(frozen=True)
@@ -211,3 +212,165 @@ def batch(client: Client, cfg: Config, selection: list[JsonDict], log: Log) -> l
     if any(str(e["report_id"]) not in wanted for e in out):
         raise RuntimeError("batch emitted a label for a report outside the selection")
     return out
+
+
+# ------------------------------------------------------------------- validate
+
+
+def _problems(item: Any, selection_ids: set[str]) -> list[str]:
+    if not isinstance(item, dict):
+        return ["extraction is not a JSON object"]
+    reasons: list[str] = []
+    if str(item.get("report_id") or "") not in selection_ids:
+        reasons.append("report_id is not in this run's selection")
+    label = item.get("label")
+    if not isinstance(label, str) or not label.strip():
+        reasons.append("label is empty or not a string")
+    if item.get("from") not in ledger.LABEL_SOURCES:
+        reasons.append(f"from must be one of {sorted(ledger.LABEL_SOURCES)}")
+    return reasons
+
+
+def validate(raw: list[Any], selection_ids: set[str]) -> tuple[list[JsonDict], list[JsonDict]]:
+    """Split extractions into (auto, review). Nothing here is a judgement call,
+    so anything malformed is a hard fail and everything else auto-applies."""
+    if not isinstance(raw, list):
+        raise TypeError("validate: raw must be a list")
+    auto: list[JsonDict] = []
+    review: list[JsonDict] = []
+    for item in raw:
+        reasons = _problems(item, selection_ids)
+        if not reasons:
+            auto.append(item)
+            continue
+        held: JsonDict = dict(item) if isinstance(item, dict) else {"item": item}
+        held["review_reasons"] = reasons
+        held["hard_fail"] = True
+        review.append(held)
+    if len(auto) + len(review) != len(raw):
+        raise RuntimeError("validate lost an extraction")
+    return auto, review
+
+
+# ---------------------------------------------------------------------- apply
+
+
+@dataclass
+class _LabelState:
+    client: Client
+    log: Log
+    color: str
+    dry_run: bool
+    ids: dict[str, str] = field(default_factory=dict)  # casefolded value -> label id
+
+
+def _label_id(state: _LabelState, label: str) -> str:
+    """Reuse a platform label equal ignoring case; create one only if none."""
+    key = label.casefold()
+    if key not in state.ids:
+        found = state.client.find_label(label)
+        state.ids[key] = found if found is not None else state.client.ensure_label(label, state.color)
+    if not state.ids[key]:
+        raise OpenCTIError(f"no label id for {label!r}")
+    return state.ids[key]
+
+
+def _row(item: JsonDict, label_id: str | None, *, preexisted: bool) -> JsonDict:
+    return ledger.label_row(
+        report_id=str(item["report_id"]), label=str(item["label"]), label_id=label_id,
+        source=str(item["from"]), source_entity=str(item.get("source_entity") or ""),
+        preexisted=preexisted,
+    )
+
+
+def _apply_one(state: _LabelState, item: JsonDict, current: set[str]) -> JsonDict | None:
+    """One label onto one report. None when the write failed (logged)."""
+    rid, label = str(item["report_id"]), str(item["label"])
+    if label.casefold() in current:
+        state.log(f"  keep {label} on {rid} (pre-existed)")
+        return _row(item, None, preexisted=True)
+    if state.dry_run:
+        state.log(f"  would label {rid}: {label}")
+        return _row(item, None, preexisted=False)
+    try:
+        label_id = _label_id(state, label)
+        state.client.add_label_to_report(rid, label_id)
+    except OpenCTIError as exc:
+        state.log(f"  ! label {rid} {label}: {exc}"[:200])
+        return None
+    current.add(label.casefold())
+    return _row(item, label_id, preexisted=False)
+
+
+def apply_labels(  # noqa: PLR0913 - client/items/log/color/dry_run/save, not a data clump
+    client: Client, items: list[JsonDict], log: Log, *, color: str, dry_run: bool, save: Save,
+) -> list[JsonDict]:
+    """Add each item's label to its report; one ledger row per item handled.
+
+    Each report's labels are re-read right before writing, so a label that
+    appeared since `batch` is ledgered preexisted and never claimed. `save`
+    checkpoints after every successful write.
+    """
+    if not isinstance(items, list):
+        raise TypeError("apply_labels: items must be a list")
+    state = _LabelState(client=client, log=log, color=color, dry_run=dry_run)
+    by_report: dict[str, list[JsonDict]] = {}
+    for item in items:
+        by_report.setdefault(str(item["report_id"]), []).append(item)
+    rows: list[JsonDict] = []
+    for rid, group in by_report.items():
+        try:
+            current = {v.casefold() for v in client.entity_labels(rid)}
+        except OpenCTIError as exc:
+            log(f"  ! {rid}: {exc}"[:200])
+            continue
+        for item in group:
+            row = _apply_one(state, item, current)
+            if row is None:
+                continue
+            rows.append(row)
+            if not dry_run and not row["preexisted"]:
+                save(rows)
+    if len(rows) > len(items):
+        raise RuntimeError("apply_labels produced more rows than items")
+    return rows
+
+
+# --------------------------------------------------------------------- revert
+
+
+def revert_labels(
+    client: Client, rows: list[JsonDict], log: Log, *, dry_run: bool = False,
+    retain: list[JsonDict] | None = None,
+) -> int:
+    """Undo `apply_labels`' `"label"` rows. Preexisted rows are left alone; a
+    removal that raises is appended to `retain` so the caller keeps it in the
+    ledger for a retry. Label objects themselves are never deleted."""
+    if not isinstance(rows, list):
+        raise TypeError("revert_labels: rows must be a list")
+    failed = retain if retain is not None else []
+    reverted = 0
+    for row in rows:
+        if row.get("kind") != "label":
+            continue
+        rid, label = str(row.get("report_id") or ""), str(row.get("label") or "")
+        if row.get("preexisted"):
+            log(f"  keep {label} on {rid} (pre-existed)")
+            continue
+        label_id = str(row.get("label_id") or "")
+        if not rid or not label_id:
+            raise OpenCTIError(f"label row has no report/label id: {str(row)[:160]}")
+        if dry_run:
+            log(f"  would remove label {label} from {rid}")
+            reverted += 1
+            continue
+        try:
+            client.remove_label_from_report(rid, label_id)
+        except OpenCTIError as exc:
+            log(f"  ! revert label {rid} {label}: {exc}"[:200])
+            failed.append(row)
+            continue
+        reverted += 1
+    if reverted > len(rows):
+        raise RuntimeError("revert_labels reverted more rows than it was given")
+    return reverted

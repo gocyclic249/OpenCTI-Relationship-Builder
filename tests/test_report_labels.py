@@ -7,15 +7,19 @@ from typing import Any
 
 import pytest
 
+from octirb import ledger
 from octirb.client import OpenCTIError
 from octirb.config import Config, SectorsCfg, SelectionCfg
 from octirb.linkers.report_labels import (
+    apply_labels,
     batch,
     build_sector_index,
     labels_for,
+    revert_labels,
     sector_roots,
     select,
     start_ids,
+    validate,
 )
 
 TREE = [
@@ -214,3 +218,156 @@ def test_batch_applies_config_aliases_casefolded():
     _lines, log = logs()
     got = batch(fake, cfg, [{"report_id": "r1"}], log)
     assert [e["label"] for e in got] == ["Energy"]
+
+
+# -- validate --------------------------------------------------------------------
+
+
+def ext(**over: Any) -> dict[str, Any]:
+    base = {"report_id": "r1", "report_name": "R", "label": "China", "from": "country",
+            "source_entity": "China", "confidence": "high"}
+    base.update(over)
+    return base
+
+
+def test_validate_good_items_auto():
+    auto, review = validate([ext(), ext(label="ICS", **{"from": "sector"})], {"r1"})
+    assert len(auto) == 2 and review == []
+
+
+@pytest.mark.parametrize("bad", [
+    ext(report_id="elsewhere"), ext(label=""), ext(label=None), ext(**{"from": "region"}),
+])
+def test_validate_bad_items_hard_fail(bad):
+    auto, review = validate([bad], {"r1"})
+    assert auto == []
+    assert review[0]["hard_fail"] is True and review[0]["review_reasons"]
+
+
+def test_validate_non_object_item_held():
+    auto, review = validate(["junk"], {"r1"})
+    assert auto == [] and review[0]["hard_fail"] is True
+
+
+# -- apply -----------------------------------------------------------------------
+
+
+class ApplyFake:
+    def __init__(self, on_report: dict[str, list[str]] | None = None,
+                 platform: dict[str, str] | None = None, fail: set[str] | None = None) -> None:
+        self.on_report = on_report or {}
+        self.platform = platform or {}   # label value -> id already on the platform
+        self.fail = fail or set()
+        self.created: list[str] = []
+        self.colors: list[str] = []
+        self.added: list[tuple[str, str]] = []
+
+    def entity_labels(self, rid: str) -> list[str]:
+        return list(self.on_report.get(rid, []))
+
+    def find_label(self, value: str) -> str | None:
+        for existing, lid in self.platform.items():
+            if existing.casefold() == value.casefold():
+                return lid
+        return None
+
+    def ensure_label(self, value: str, color: str) -> str:
+        self.created.append(value)
+        self.colors.append(color)
+        return f"new-{value}"
+
+    def add_label_to_report(self, rid: str, label_id: str) -> None:
+        if label_id in self.fail:
+            raise OpenCTIError("boom")
+        self.added.append((rid, label_id))
+
+
+def run_apply(fake: ApplyFake, items: list[dict[str, Any]], *, dry_run: bool = False):
+    saves: list[int] = []
+    lines, log = logs()
+    rows = apply_labels(fake, items, log, color="#5b6abf", dry_run=dry_run,
+                        save=lambda rows: saves.append(len(rows)))
+    return rows, saves, lines
+
+
+def test_apply_writes_and_checkpoints_each_write():
+    fake = ApplyFake()
+    rows, saves, _ = run_apply(fake, [ext(), ext(label="ICS", **{"from": "sector"})])
+    assert fake.added == [("r1", "new-China"), ("r1", "new-ICS")]
+    assert [r["preexisted"] for r in rows] == [False, False]
+    assert [r["label_id"] for r in rows] == ["new-China", "new-ICS"]
+    assert saves == [1, 2]
+    assert fake.colors == ["#5b6abf", "#5b6abf"]
+
+
+def test_apply_reuses_platform_label_ignoring_case():
+    """Review Focus 2."""
+    fake = ApplyFake(platform={"ics": "L-ics"})
+    rows, _, _ = run_apply(fake, [ext(label="ICS", **{"from": "sector"})])
+    assert fake.created == [] and fake.added == [("r1", "L-ics")]
+    assert rows[0]["label_id"] == "L-ics"
+
+
+def test_apply_label_present_at_apply_time_is_preexisted():
+    """Review Focus 1, at apply time: someone added `china` since batch."""
+    fake = ApplyFake(on_report={"r1": ["china"]})
+    rows, saves, _ = run_apply(fake, [ext()])
+    assert fake.added == [] and saves == []
+    assert rows[0]["preexisted"] is True and rows[0]["label_id"] is None
+
+
+def test_apply_failed_write_not_ledgered():
+    fake = ApplyFake(fail={"new-China"})
+    rows, saves, lines = run_apply(fake, [ext(), ext(label="ICS", **{"from": "sector"})])
+    assert [r["label"] for r in rows] == ["ICS"]
+    assert saves == [1]
+    assert any("boom" in line for line in lines)
+
+
+def test_apply_dry_run_writes_nothing():
+    fake = ApplyFake()
+    rows, saves, _ = run_apply(fake, [ext()], dry_run=True)
+    assert fake.added == [] and fake.created == [] and saves == []
+    assert rows[0]["preexisted"] is False
+
+
+# -- revert ----------------------------------------------------------------------
+
+
+class RevertFake:
+    def __init__(self, fail: set[str] | None = None) -> None:
+        self.fail = fail or set()
+        self.removed: list[tuple[str, str]] = []
+
+    def remove_label_from_report(self, rid: str, label_id: str) -> None:
+        if label_id in self.fail:
+            raise OpenCTIError("boom")
+        self.removed.append((rid, label_id))
+
+
+def lrow(label: str, label_id: str | None, *, preexisted: bool = False) -> dict[str, Any]:
+    return ledger.label_row(report_id="r1", label=label, label_id=label_id, source="country",
+                            source_entity=label, preexisted=preexisted)
+
+
+def test_revert_removes_ours_keeps_preexisted_and_other_kinds():
+    fake = RevertFake()
+    other = ledger.entity_row(entity_id="e1", entity_type="Intrusion-Set", name="X")
+    _lines, log = logs()
+    n = revert_labels(fake, [lrow("China", "L1"), lrow("ICS", None, preexisted=True), other], log)
+    assert n == 1 and fake.removed == [("r1", "L1")]
+
+
+def test_revert_failure_retained_for_retry():
+    fake = RevertFake(fail={"L1"})
+    retain: list[dict[str, Any]] = []
+    _lines, log = logs()
+    n = revert_labels(fake, [lrow("China", "L1"), lrow("ICS", "L2")], log, retain=retain)
+    assert n == 1 and [r["label"] for r in retain] == ["China"]
+
+
+def test_revert_dry_run_removes_nothing():
+    fake = RevertFake()
+    _lines, log = logs()
+    assert revert_labels(fake, [lrow("China", "L1")], log, dry_run=True) == 1
+    assert fake.removed == []
