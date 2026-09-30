@@ -1,6 +1,6 @@
 ---
 name: octi-link-reports
-description: Run one report-* linker pass (report-location, report-sector, report-actor or report-vuln) end to end — select, fetch, batch, extract against CONTRACT.md, validate, dry-run and apply. Trigger on "link reports", "enrich OpenCTI", "link locations", "link sectors", "link actors to reports", "run the location linker", "run the sector linker", "run the actor linker", or "link CVEs".
+description: Run one report-* linker pass (report-location, report-sector, report-actor, report-vuln or report-labels) end to end — select, fetch, batch, extract against CONTRACT.md, validate, dry-run and apply. Trigger on "link reports", "enrich OpenCTI", "link locations", "link sectors", "link actors to reports", "run the location linker", "run the sector linker", "run the actor linker", "link CVEs", or "label reports".
 ---
 
 # octi-link-reports
@@ -9,8 +9,8 @@ description: Run one report-* linker pass (report-location, report-sector, repor
 > `CLAUDE_PLUGIN_ROOT` for plugin skills. From a repo clone, run `bin/octi-rb`
 > from the repository root instead.
 
-Runs one of the four report-scoped linkers — `report-location`,
-`report-sector`, `report-actor`, `report-vuln` — through the full pipeline
+Runs one of the five report-scoped linkers — `report-location`,
+`report-sector`, `report-actor`, `report-vuln`, `report-labels` — through the full pipeline
 for one run. Run `octi-setup` first if `${CLAUDE_PLUGIN_ROOT}/bin/octi-rb doctor` isn't clean.
 Every command below accepts `--run-id`; omit it once you have a run open and
 every later command defaults to the most recently created run.
@@ -58,6 +58,12 @@ every later command defaults to the most recently created run.
    `extractions.json` itself — no `batch.json`, no `CONTRACT.md`, no
    extraction task. For `report-vuln`, skip straight to **step 5 (validate)**
    after this command.
+
+   **`report-labels` has no fetch and no model step.** Skip `fetch`; `batch`
+   derives labels deterministically and writes `extractions.json`, so go
+   straight to **step 5 (validate)**. It selects reports that already contain
+   objects (the reverse of the other linkers' default), so `--all-reports` is
+   ignored.
 
 4. **Structured pass, then the extraction task** (report-location /
    report-sector / report-actor only):
@@ -193,3 +199,12 @@ characters of surrounding text on each side as evidence. It never guesses at
 an unresolved CVE ID: with NVD feeds present on most platforms, an
 unrecognized ID is more likely wrong than new, so it goes to review at
 `validate` instead of being invented.
+
+### report-labels
+
+- Labels are the platform Country name and the top-level root Sector name,
+  verbatim — no `AI-` prefix.
+- Every extraction is `confidence: high`; `review.json` only ever holds
+  malformed rows (`hard_fail: true`). Nothing to judge.
+- A label already on the report (any case) is never re-added and never
+  removed by `revert`.

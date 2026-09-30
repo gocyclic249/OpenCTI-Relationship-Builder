@@ -103,6 +103,31 @@ def entity_row(*, entity_id: str, entity_type: str, name: str) -> JsonDict:
     return row
 
 
+LABEL_SOURCES = frozenset({"country", "sector"})
+
+
+def label_row(  # noqa: PLR0913 - named ledger fields, not a data clump
+    *, report_id: str, label: str, label_id: str | None, source: str, source_entity: str,
+    preexisted: bool,
+) -> JsonDict:
+    """A report-carries-label row (report-labels linker).
+
+    `label_id` is None when nothing was written (the label pre-existed on the
+    report). The key is the casefolded label, not the id: pre-existence is
+    decided by value, and a preexisted row has no id to key on.
+    """
+    if not report_id or not label:
+        raise ValueError("label row needs report_id and label")
+    if source not in LABEL_SOURCES:
+        raise ValueError(f"label row source must be one of {sorted(LABEL_SOURCES)} (got {source!r})")
+    row: JsonDict = {
+        "kind": "label", "report_id": report_id, "label": label, "label_id": label_id,
+        "source": source, "source_entity": source_entity, "preexisted": bool(preexisted),
+    }
+    row_key(row)
+    return row
+
+
 def row_key(row: JsonDict) -> RowKey:
     """The dedupe/merge key for one row, dispatched on `row["kind"]`.
 
@@ -111,6 +136,7 @@ def row_key(row: JsonDict) -> RowKey:
         ported octirel `ledger_key`.
     alias -> ("alias", entity_id, alias)
     entity -> ("entity", entity_id)
+    label -> ("label", report_id, label casefolded)
     """
     if not isinstance(row, dict):
         raise TypeError("row must be a dict")
@@ -124,6 +150,8 @@ def row_key(row: JsonDict) -> RowKey:
         key = ("alias", str(row["entity_id"]), str(row["alias"]))
     elif kind == "entity":
         key = ("entity", str(row["entity_id"]))
+    elif kind == "label":
+        key = ("label", str(row["report_id"]), str(row["label"]).casefold())
     else:
         raise ValueError(f"row_key: unknown or missing row kind: {kind!r}")
     if not all(key):
@@ -232,10 +260,10 @@ def _merge_dedupe_prior_wins(prior: list[JsonDict], fresh: list[JsonDict]) -> li
 
 
 def merge_ledger(prior: list[JsonDict], fresh: list[JsonDict]) -> list[JsonDict]:
-    """One row per key, across all four row kinds.
+    """One row per key, across all five row kinds.
 
     Relationship rows merge via the octirel algorithm (`_merge_relationship_rows`
-    / `_merge_pair`). Containment, alias and entity rows dedupe by `row_key`
+    / `_merge_pair`). Containment, alias, entity and label rows dedupe by `row_key`
     with prior kept, first occurrence wins (ported octigeo behaviour).
 
     Post-condition: the merged ledger's key set is exactly the union of the

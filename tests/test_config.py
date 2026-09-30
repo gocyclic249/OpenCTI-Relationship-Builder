@@ -100,3 +100,30 @@ def test_disk_warn(tmp_path, capsys, monkeypatch):
     lines: list[str] = []
     c.check_disk(cfg, lines.append)
     assert any("threshold 1%" in ln for ln in lines)
+
+
+def test_report_labels_defaults(tmp_path, monkeypatch):
+    monkeypatch.delenv("OCTI_RB_CONFIG", raising=False)
+    monkeypatch.chdir(tmp_path)
+    cfg = load_config(None)
+    assert cfg.report_labels.enabled is True
+    assert cfg.report_labels.color == "#5b6abf"
+
+
+def test_report_labels_parsed(tmp_path):
+    p = write(tmp_path, '[report_labels]\nenabled = false\ncolor = "#AABBCC"\n')
+    cfg = load_config(p)
+    assert cfg.report_labels.enabled is False
+    assert cfg.report_labels.color == "#AABBCC"
+
+
+def test_report_labels_bad_color_rejected(tmp_path):
+    p = write(tmp_path, '[report_labels]\ncolor = "blue"\n')
+    with pytest.raises(SystemExit, match=r"\[report_labels\]\.color"):
+        load_config(p)
+
+
+def test_report_labels_unknown_key_rejected(tmp_path):
+    p = write(tmp_path, "[report_labels]\nprefix = 'x'\n")
+    with pytest.raises(SystemExit, match="prefix"):
+        load_config(p)

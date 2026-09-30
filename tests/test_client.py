@@ -284,3 +284,120 @@ def test_download_wraps_transport_errors(monkeypatch, exc):
     monkeypatch.setattr(urllib.request, "urlopen", boom)
     with pytest.raises(OpenCTIError):
         _client().download("f1")
+
+
+# -- report-labels reads ---------------------------------------------------------
+
+
+def _obj_page(edges, *, more, cursor=None, labels=("china",)):
+    return {"report": {
+        "id": "r1", "name": "Report One",
+        "objectLabel": [{"value": v} for v in labels],
+        "objects": {"pageInfo": {"endCursor": cursor, "hasNextPage": more}, "edges": edges},
+    }}
+
+
+def test_report_label_sources_splits_countries_and_sectors_across_pages(fake_gql_client):
+    client, _calls = fake_gql_client({})
+    pages = iter([
+        _obj_page([{"node": {"id": "c1", "name": "China", "entity_type": "Country"}},
+                   {"node": {}}], more=True, cursor="k1"),
+        _obj_page([{"node": {"id": "s1", "name": "Electricity", "entity_type": "Sector"}},
+                   {"node": None}], more=False),
+    ])
+    sent = []
+
+    def paged(_query, variables=None):
+        sent.append(variables)
+        return next(pages)
+
+    client.gql = paged
+    got = client.report_label_sources("r1")
+    assert got == {
+        "id": "r1", "name": "Report One", "labels": ["china"],
+        "countries": [{"id": "c1", "name": "China"}],
+        "sectors": [{"id": "s1", "name": "Electricity"}],
+    }
+    assert sent == [{"id": "r1", "after": None}, {"id": "r1", "after": "k1"}]
+
+
+def test_report_label_sources_missing_report_raises(fake_gql_client):
+    client, _calls = fake_gql_client({"report": None})
+    with pytest.raises(OpenCTIError, match="not found"):
+        client.report_label_sources("r1")
+
+
+def test_report_label_sources_needs_an_id(fake_gql_client):
+    client, _calls = fake_gql_client({})
+    with pytest.raises(OpenCTIError):
+        client.report_label_sources("")
+
+
+def test_sector_parents_shape(fake_gql_client):
+    client, _calls = fake_gql_client({"sectors": {
+        "pageInfo": {"endCursor": None, "hasNextPage": False},
+        "edges": [
+            {"node": {"id": "s1", "name": "Electricity",
+                      "parentSectors": {"edges": [{"node": {"id": "s0"}}]}}},
+            {"node": {"id": "s0", "name": "Energy", "parentSectors": {"edges": []}}},
+        ],
+    }})
+    assert client.sector_parents() == [
+        {"id": "s1", "name": "Electricity", "parent_ids": ["s0"]},
+        {"id": "s0", "name": "Energy", "parent_ids": []},
+    ]
+
+
+def test_find_label_prefers_exact_then_casefold(fake_gql_client):
+    client, _calls = fake_gql_client({"labels": {
+        "pageInfo": {"endCursor": None, "hasNextPage": False},
+        "edges": [
+            {"node": {"id": "L-lower", "value": "ics"}},
+            {"node": {"id": "L-exact", "value": "ICS"}},
+        ],
+    }})
+    assert client.find_label("ICS") == "L-exact"
+    assert client.find_label("Ics") == "L-lower"
+
+
+def test_find_label_absent_and_substring_only(fake_gql_client):
+    client, _calls = fake_gql_client({"labels": {
+        "pageInfo": {"endCursor": None, "hasNextPage": False},
+        "edges": [
+            {"node": {"id": "L1", "value": "octi-geo-ics"}},
+        ],
+    }})
+    assert client.find_label("ICS") is None
+
+
+def test_find_label_casefold_match_on_page_2(fake_gql_client):
+    client, _calls = fake_gql_client({})
+    pages = iter([
+        {"labels": {
+            "pageInfo": {"endCursor": "k1", "hasNextPage": True},
+            "edges": [
+                {"node": {"id": "L1", "value": "other-label"}},
+            ],
+        }},
+        {"labels": {
+            "pageInfo": {"endCursor": None, "hasNextPage": False},
+            "edges": [
+                {"node": {"id": "L-fold", "value": "ics"}},
+            ],
+        }},
+    ])
+    sent = []
+
+    def paged(_query, variables=None):
+        sent.append(variables)
+        return next(pages)
+
+    client.gql = paged
+    assert client.find_label("ICS") == "L-fold"
+    assert sent == [{"s": "ICS", "after": None}, {"s": "ICS", "after": "k1"}]
+
+
+def test_find_label_needs_a_value(fake_gql_client):
+    client, _calls = fake_gql_client({})
+    with pytest.raises(OpenCTIError):
+        client.find_label("  ")

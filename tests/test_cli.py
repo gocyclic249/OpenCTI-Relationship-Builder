@@ -19,7 +19,7 @@ import pytest
 
 from octirb import cli, ledger
 from octirb.client import ACTOR_DELETES, OpenCTIError
-from octirb.config import ActorsCfg, Config, RunsCfg
+from octirb.config import ActorsCfg, Config, ReportLabelsCfg, RunsCfg, SelectionCfg
 from octirb.linkers import REGISTRY
 from octirb.linkers.base import Linker
 from octirb.resolvers.actors import ActorVocabulary
@@ -713,3 +713,113 @@ def test_crosswalk_refresh_dispatches(tmp_path: Path, monkeypatch: pytest.Monkey
     result = cli.cmd_crosswalk(ns(action="refresh"))
     assert result == cli.EXIT_OK
     assert calls == [cfg.cache_dir]
+
+
+# ------------------------------------------------------------- report-labels
+
+
+class LabelsFakeClient:
+    """Enough of Client for select -> batch -> validate -> apply -> revert."""
+
+    def __init__(self) -> None:
+        self.on_report: dict[str, list[str]] = {"r1": ["china"]}
+        self.added: list[tuple[str, str]] = []
+        self.removed: list[tuple[str, str]] = []
+
+    def reports(self) -> Any:
+        full = dict(report_node("r1", "Report One"),
+                    objects={"edges": [{"node": {"entity_type": "Country"}}]})
+        return iter([full, report_node("r2", "Empty")])
+
+    def sector_parents(self) -> list[dict[str, Any]]:
+        return [{"id": "s-ics", "name": "ICS", "parent_ids": []},
+                {"id": "s-man", "name": "Manufacturing", "parent_ids": ["s-ics"]}]
+
+    def report_label_sources(self, rid: str) -> dict[str, Any]:
+        return {"id": rid, "name": "Report One", "labels": list(self.on_report.get(rid, [])),
+                "countries": [{"id": "c1", "name": "China"}, {"id": "c2", "name": "United States"}],
+                "sectors": [{"id": "s-man", "name": "Manufacturing"}]}
+
+    def entity_labels(self, rid: str) -> list[str]:
+        return list(self.on_report.get(rid, []))
+
+    def find_label(self, value: str) -> str | None:
+        return None
+
+    def ensure_label(self, value: str, color: str) -> str:
+        return f"label-{value}"
+
+    def add_label_to_report(self, rid: str, label_id: str) -> None:
+        self.added.append((rid, label_id))
+        self.on_report.setdefault(rid, []).append(label_id.removeprefix("label-"))
+
+    def remove_label_from_report(self, rid: str, label_id: str) -> None:
+        self.removed.append((rid, label_id))
+
+
+def test_report_labels_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = make_cfg(tmp_path, selection=SelectionCfg(since_days=0))
+    monkeypatch.setattr(cli, "_load_cfg", lambda _args: cfg)
+    fake = LabelsFakeClient()
+    monkeypatch.setattr(cli, "_client", lambda _cfg: fake)
+    run_dir = tmp_path / "L1"
+
+    assert cli.cmd_select(ns(linker="report-labels", run_id="L1")) == cli.EXIT_OK
+    assert [s["report_id"] for s in json.loads((run_dir / "selection.json").read_text())] == ["r1"]
+
+    assert cli.cmd_batch(ns(run_id="L1")) == cli.EXIT_OK
+    labels = [e["label"] for e in json.loads((run_dir / "extractions.json").read_text())]
+    assert labels == ["United States", "ICS"]
+
+    assert cli.cmd_validate(ns(run_id="L1")) == cli.EXIT_OK
+    assert len(json.loads((run_dir / "auto.json").read_text())) == 2
+
+    assert cli.cmd_apply(ns(run_id="L1", dry_run=True)) == cli.EXIT_OK
+    assert fake.added == [] and not (run_dir / "applied.json").exists()
+
+    assert cli.cmd_apply(ns(run_id="L1")) == cli.EXIT_OK
+    assert fake.added == [("r1", "label-United States"), ("r1", "label-ICS")]
+    assert len(json.loads((run_dir / "applied.json").read_text())) == 2
+
+    assert cli.cmd_revert(ns(run_id="L1")) == cli.EXIT_OK
+    assert sorted(fake.removed) == [("r1", "label-ICS"), ("r1", "label-United States")]
+    assert json.loads((run_dir / "applied.json").read_text()) == []
+
+
+def test_revert_mixed_ledger_touches_each_kind_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_dir = tmp_path / "r1"
+    write_meta(run_dir, linker="report-location")
+    contain = ledger.containment_row(
+        report_id="r1", entity_id="e1", entity_name="France", linker="report-location",
+        key="FRA", role="target", confidence="high", evidence="q", label_id=None, created=False,
+    )
+    label = ledger.label_row(report_id="r1", label="France", label_id="L-fr", source="country",
+                             source_entity="France", preexisted=False)
+    (run_dir / "applied.json").write_text(json.dumps([contain, label]))
+    cfg = make_cfg(tmp_path)
+    monkeypatch.setattr(cli, "_load_cfg", lambda _args: cfg)
+    fake = RevertFakeClient()
+    monkeypatch.setattr(cli, "_client", lambda _cfg: fake)
+
+    assert cli.cmd_revert(ns(run_id="r1")) == cli.EXIT_OK
+    assert fake.removed_objects == [("r1", "e1")]
+    assert fake.removed_labels == [("r1", "L-fr")]
+
+
+def test_select_report_labels_disabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = make_cfg(tmp_path, report_labels=ReportLabelsCfg(enabled=False))
+    monkeypatch.setattr(cli, "_load_cfg", lambda _args: cfg)
+    with pytest.raises(SystemExit, match=r"report-labels is disabled"):
+        cli.cmd_select(ns(linker="report-labels"))
+
+
+def test_fetch_refuses_report_labels(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    write_meta(tmp_path / "L1", linker="report-labels")
+    cfg = make_cfg(tmp_path)
+    monkeypatch.setattr(cli, "_load_cfg", lambda _args: cfg)
+    assert cli.cmd_fetch(ns(run_id="L1")) == cli.EXIT_BAD_RUN
+
+
+def test_doctor_linkers_skips_report_labels(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "REGISTRY", {"report-labels": REGISTRY["report-labels"]})
+    assert cli._doctor_linkers(object(), make_cfg(tmp_path)) is True  # type: ignore[arg-type]

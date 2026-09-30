@@ -1,0 +1,434 @@
+"""report-labels linker: sector root walk, label derivation, select/batch,
+validate, apply and revert -- all against hand-written fakes, no network."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+
+from octirb import ledger
+from octirb.client import OpenCTIError
+from octirb.config import Config, SectorsCfg, SelectionCfg
+from octirb.linkers.report_labels import (
+    apply_labels,
+    batch,
+    build_sector_index,
+    labels_for,
+    revert_labels,
+    sector_roots,
+    select,
+    start_ids,
+    validate,
+)
+
+TREE = [
+    {"id": "ics", "name": "ICS", "parent_ids": []},
+    {"id": "energy", "name": "Energy", "parent_ids": []},
+    {"id": "elec", "name": "Electricity", "parent_ids": ["energy", "ics"]},
+    {"id": "grid", "name": "Grid operators", "parent_ids": ["elec"]},
+    {"id": "orphan", "name": "Orphan", "parent_ids": ["hidden-parent"]},
+    {"id": "dup", "name": "Energy & Utilities", "parent_ids": []},
+    {"id": "cyc-a", "name": "A", "parent_ids": ["cyc-b"]},
+    {"id": "cyc-b", "name": "B", "parent_ids": ["cyc-a"]},
+]
+INDEX = build_sector_index(TREE)
+
+
+def logs() -> tuple[list[str], Any]:
+    lines: list[str] = []
+    return lines, lines.append
+
+
+def report(**over: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {"id": "r1", "name": "Report One", "labels": [],
+                            "countries": [], "sectors": []}
+    base.update(over)
+    return base
+
+
+# -- sector_roots ----------------------------------------------------------------
+
+
+def test_root_sector_is_its_own_root():
+    assert sector_roots(INDEX, "ics") == ["ICS"]
+
+
+def test_dual_parent_yields_every_root():
+    assert sector_roots(INDEX, "grid") == ["Energy", "ICS"]
+
+
+def test_invisible_parent_counts_as_root():
+    """Review Focus 3."""
+    assert sector_roots(INDEX, "orphan") == ["Orphan"]
+
+
+def test_cycle_with_no_root_raises():
+    with pytest.raises(ValueError, match="cycle"):
+        sector_roots(INDEX, "cyc-a")
+
+
+def test_unknown_sector_raises():
+    with pytest.raises(ValueError, match="not on the platform"):
+        sector_roots(INDEX, "nope")
+
+
+# -- start_ids -------------------------------------------------------------------
+
+
+def test_alias_redirects_walk_start():
+    assert start_ids(INDEX, "dup", {"energy & utilities": "Energy"}) == ["energy"]
+
+
+def test_no_alias_starts_at_sector():
+    assert start_ids(INDEX, "grid", {}) == ["grid"]
+
+
+def test_alias_target_missing_raises():
+    with pytest.raises(ValueError, match="alias target"):
+        start_ids(INDEX, "dup", {"energy & utilities": "Nope"})
+
+
+# -- labels_for ------------------------------------------------------------------
+
+
+def test_countries_and_sector_roots_become_labels():
+    lines, log = logs()
+    got = labels_for(report(countries=[{"id": "c1", "name": "United States"}],
+                            sectors=[{"id": "grid", "name": "Grid operators"}]), INDEX, {}, log)
+    assert [(e["label"], e["from"], e["source_entity"]) for e in got] == [
+        ("United States", "country", "United States"),
+        ("Energy", "sector", "Grid operators"),
+        ("ICS", "sector", "Grid operators"),
+    ]
+    assert all(e["confidence"] == "high" and e["report_id"] == "r1" for e in got)
+    assert lines == []
+
+
+def test_existing_labels_dropped_casefolded():
+    """Review Focus 1: `china` on the report already covers Country `China`."""
+    _lines, log = logs()
+    got = labels_for(report(labels=["china", "ics"], countries=[{"id": "c1", "name": "China"}],
+                            sectors=[{"id": "elec", "name": "Electricity"}]), INDEX, {}, log)
+    assert [e["label"] for e in got] == ["Energy"]
+
+
+def test_shared_root_deduped():
+    _lines, log = logs()
+    got = labels_for(report(sectors=[{"id": "elec", "name": "Electricity"},
+                                     {"id": "grid", "name": "Grid operators"}]), INDEX, {}, log)
+    assert [e["label"] for e in got] == ["Energy", "ICS"]
+
+
+def test_alias_applied_before_walk():
+    _lines, log = logs()
+    got = labels_for(report(sectors=[{"id": "dup", "name": "Energy & Utilities"}]),
+                     INDEX, {"energy & utilities": "Energy"}, log)
+    assert [e["label"] for e in got] == ["Energy"]
+
+
+def test_bad_sector_logged_other_labels_kept():
+    lines, log = logs()
+    got = labels_for(report(countries=[{"id": "c1", "name": "Germany"}],
+                            sectors=[{"id": "cyc-a", "name": "A"}]), INDEX, {}, log)
+    assert [e["label"] for e in got] == ["Germany"]
+    assert len(lines) == 1 and "cyc-a" in lines[0]
+
+
+def test_nothing_to_add():
+    _lines, log = logs()
+    assert labels_for(report(), INDEX, {}, log) == []
+
+
+def test_labels_for_rejects_non_report():
+    _lines, log = logs()
+    with pytest.raises(TypeError):
+        labels_for({"name": "no id"}, INDEX, {}, log)
+
+
+# -- select / batch --------------------------------------------------------------
+
+
+def node(rid: str, *, objects: int = 1, published: str = "2026-09-01",
+         source: str = "Vendor", name: str = "") -> dict[str, Any]:
+    return {
+        "id": rid, "name": name or f"Report {rid}", "description": "",
+        "created": published, "published": published, "createdBy": {"name": source},
+        "objects": {"edges": [{"node": {"entity_type": "Country"}}] * objects},
+        "externalReferences": {"edges": []},
+    }
+
+
+class SelectFake:
+    def __init__(self, nodes: list[dict[str, Any]]) -> None:
+        self._nodes = nodes
+
+    def reports(self) -> Any:
+        return iter(self._nodes)
+
+
+def test_select_requires_objects_and_keeps_textless_reports():
+    cfg = Config(selection=SelectionCfg(since_days=0))
+    _lines, log = logs()
+    got = select(SelectFake([node("r1"), node("r2", objects=0)]), cfg, log, limit=None, since=None)
+    assert got == [{"report_id": "r1", "name": "Report r1", "source": "Vendor"}]
+
+
+def test_select_honours_gates_and_limit():
+    cfg = Config(selection=SelectionCfg(since_days=0, exclude_sources=("Noise",),
+                                        exclude_title_patterns=("^weekly",)))
+    _lines, log = logs()
+    nodes = [node("old", published="2020-01-01"), node("n1", source="Noise"),
+             node("t1", name="Weekly digest"), node("r1"), node("r2")]
+    got = select(SelectFake(nodes), cfg, log, limit=1, since="2026-01-01")
+    assert [g["report_id"] for g in got] == ["r1"]
+
+
+def test_select_rejects_bad_limit():
+    _lines, log = logs()
+    with pytest.raises(ValueError):
+        select(SelectFake([]), Config(), log, limit=0, since=None)
+
+
+def test_select_ignores_config_since_days():
+    """No explicit `since` backfills the whole corpus, ignoring [selection].since_days."""
+    cfg = Config(selection=SelectionCfg(since_days=183))
+    _lines, log = logs()
+    got = select(SelectFake([node("old", published="2020-01-01")]), cfg, log, limit=None, since=None)
+    assert [g["report_id"] for g in got] == ["old"]
+
+
+class BatchFake:
+    def __init__(self, reports: dict[str, dict[str, Any]]) -> None:
+        self._reports = reports
+
+    def sector_parents(self) -> list[dict[str, Any]]:
+        return TREE
+
+    def report_label_sources(self, rid: str) -> dict[str, Any]:
+        if rid not in self._reports:
+            raise OpenCTIError(f"report {rid} not found")
+        return self._reports[rid]
+
+
+def test_batch_skips_vanished_report_and_continues():
+    """Review Focus 5."""
+    fake = BatchFake({"r2": report(id="r2", countries=[{"id": "c", "name": "France"}])})
+    lines, log = logs()
+    got = batch(fake, Config(), [{"report_id": "gone"}, {"report_id": "r2"}], log)
+    assert [(e["report_id"], e["label"]) for e in got] == [("r2", "France")]
+    assert any("gone" in line for line in lines)
+
+
+def test_batch_applies_config_aliases_casefolded():
+    fake = BatchFake({"r1": report(sectors=[{"id": "dup", "name": "Energy & Utilities"}])})
+    cfg = Config(sectors=SectorsCfg(aliases={"Energy & Utilities": "Energy"}))
+    _lines, log = logs()
+    got = batch(fake, cfg, [{"report_id": "r1"}], log)
+    assert [e["label"] for e in got] == ["Energy"]
+
+
+# -- validate --------------------------------------------------------------------
+
+
+def ext(**over: Any) -> dict[str, Any]:
+    base = {"report_id": "r1", "report_name": "R", "label": "China", "from": "country",
+            "source_entity": "China", "confidence": "high"}
+    base.update(over)
+    return base
+
+
+def test_validate_good_items_auto():
+    auto, review = validate([ext(), ext(label="ICS", **{"from": "sector"})], {"r1"})
+    assert len(auto) == 2 and review == []
+
+
+@pytest.mark.parametrize("bad", [
+    ext(report_id="elsewhere"), ext(label=""), ext(label=None), ext(**{"from": "region"}),
+    ext(**{"from": ["country"]}), ext(**{"from": {}}),
+])
+def test_validate_bad_items_hard_fail(bad):
+    auto, review = validate([bad], {"r1"})
+    assert auto == []
+    assert review[0]["hard_fail"] is True and review[0]["review_reasons"]
+
+
+def test_validate_non_object_item_held():
+    auto, review = validate(["junk"], {"r1"})
+    assert auto == [] and review[0]["hard_fail"] is True
+
+
+# -- apply -----------------------------------------------------------------------
+
+
+class ApplyFake:
+    def __init__(self, on_report: dict[str, list[str]] | None = None,
+                 platform: dict[str, str] | None = None, fail: set[str] | None = None) -> None:
+        self.on_report = on_report or {}
+        self.platform = platform or {}   # label value -> id already on the platform
+        self.fail = fail or set()
+        self.created: list[str] = []
+        self.colors: list[str] = []
+        self.added: list[tuple[str, str]] = []
+
+    def entity_labels(self, rid: str) -> list[str]:
+        return list(self.on_report.get(rid, []))
+
+    def find_label(self, value: str) -> str | None:
+        for existing, lid in self.platform.items():
+            if existing.casefold() == value.casefold():
+                return lid
+        return None
+
+    def ensure_label(self, value: str, color: str) -> str:
+        self.created.append(value)
+        self.colors.append(color)
+        return f"new-{value}"
+
+    def add_label_to_report(self, rid: str, label_id: str) -> None:
+        if label_id in self.fail:
+            raise OpenCTIError("boom")
+        self.added.append((rid, label_id))
+
+
+def run_apply(fake: ApplyFake, items: list[dict[str, Any]], *, dry_run: bool = False):
+    saves: list[int] = []
+    lines, log = logs()
+    rows = apply_labels(fake, items, log, color="#5b6abf", dry_run=dry_run,
+                        save=lambda rows: saves.append(len(rows)))
+    return rows, saves, lines
+
+
+def test_apply_writes_and_checkpoints_each_write():
+    fake = ApplyFake()
+    rows, saves, _ = run_apply(fake, [ext(), ext(label="ICS", **{"from": "sector"})])
+    assert fake.added == [("r1", "new-China"), ("r1", "new-ICS")]
+    assert [r["preexisted"] for r in rows] == [False, False]
+    assert [r["label_id"] for r in rows] == ["new-China", "new-ICS"]
+    assert saves == [1, 2]
+    assert fake.colors == ["#5b6abf", "#5b6abf"]
+
+
+def test_apply_reuses_platform_label_ignoring_case():
+    """Review Focus 2."""
+    fake = ApplyFake(platform={"ics": "L-ics"})
+    rows, _, _ = run_apply(fake, [ext(label="ICS", **{"from": "sector"})])
+    assert fake.created == [] and fake.added == [("r1", "L-ics")]
+    assert rows[0]["label_id"] == "L-ics"
+
+
+def test_apply_label_present_at_apply_time_is_preexisted():
+    """Review Focus 1, at apply time: someone added `china` since batch."""
+    fake = ApplyFake(on_report={"r1": ["china"]})
+    rows, saves, _ = run_apply(fake, [ext()])
+    assert fake.added == [] and saves == []
+    assert rows[0]["preexisted"] is True and rows[0]["label_id"] is None
+
+
+def test_apply_failed_write_not_ledgered():
+    fake = ApplyFake(fail={"new-China"})
+    rows, saves, lines = run_apply(fake, [ext(), ext(label="ICS", **{"from": "sector"})])
+    assert [r["label"] for r in rows] == ["ICS"]
+    assert saves == [1]
+    assert any("boom" in line for line in lines)
+
+
+def test_apply_dry_run_writes_nothing():
+    fake = ApplyFake()
+    rows, saves, lines = run_apply(fake, [ext()], dry_run=True)
+    assert fake.added == [] and fake.created == [] and saves == []
+    assert rows[0]["preexisted"] is False
+    assert any("would label r1: China (new label)" in line for line in lines)
+
+
+def test_apply_dry_run_reports_existing_label():
+    fake = ApplyFake(platform={"ics": "L-ics"})
+    rows, saves, lines = run_apply(fake, [ext(label="ICS", **{"from": "sector"})], dry_run=True)
+    assert any("would label r1: ICS (existing label)" in line for line in lines)
+    assert fake.created == [] and fake.added == [] and saves == []
+    assert rows[0]["preexisted"] is False
+
+
+def test_apply_dry_run_find_label_error_still_yields_row():
+    class Boom(ApplyFake):
+        def find_label(self, _value: str) -> str | None:
+            raise OpenCTIError("lookup down")
+
+    fake = Boom()
+    rows, _saves, lines = run_apply(fake, [ext()], dry_run=True)
+    assert len(rows) == 1 and fake.created == [] and fake.added == []
+    assert any("lookup down" in line for line in lines)
+
+
+@pytest.mark.parametrize("bad", [
+    ext(label=""), ext(label=" "), ext(report_id=""), ext(label=None),
+])
+def test_apply_rejects_malformed_item(bad):
+    with pytest.raises(ValueError):
+        run_apply(ApplyFake(), [bad])
+
+
+def test_labels_for_rejects_non_list_sectors():
+    report = {"id": "r1", "name": "R", "labels": [], "countries": [], "sectors": "Energy"}
+    _lines, log = logs()
+    with pytest.raises(TypeError):
+        labels_for(report, {}, {}, log)
+
+
+# -- revert ----------------------------------------------------------------------
+
+
+class RevertFake:
+    def __init__(self, fail: set[str] | None = None) -> None:
+        self.fail = fail or set()
+        self.removed: list[tuple[str, str]] = []
+
+    def remove_label_from_report(self, rid: str, label_id: str) -> None:
+        if label_id in self.fail:
+            raise OpenCTIError("boom")
+        self.removed.append((rid, label_id))
+
+
+def lrow(label: str, label_id: str | None, *, preexisted: bool = False) -> dict[str, Any]:
+    return ledger.label_row(report_id="r1", label=label, label_id=label_id, source="country",
+                            source_entity=label, preexisted=preexisted)
+
+
+def test_revert_removes_ours_keeps_preexisted_and_other_kinds():
+    fake = RevertFake()
+    other = ledger.entity_row(entity_id="e1", entity_type="Intrusion-Set", name="X")
+    _lines, log = logs()
+    n = revert_labels(fake, [lrow("China", "L1"), lrow("ICS", None, preexisted=True), other], log)
+    assert n == 1 and fake.removed == [("r1", "L1")]
+
+
+def test_revert_failure_retained_for_retry():
+    fake = RevertFake(fail={"L1"})
+    retain: list[dict[str, Any]] = []
+    _lines, log = logs()
+    n = revert_labels(fake, [lrow("China", "L1"), lrow("ICS", "L2")], log, retain=retain)
+    assert n == 1 and [r["label"] for r in retain] == ["China"]
+
+
+def test_revert_dry_run_removes_nothing():
+    fake = RevertFake()
+    _lines, log = logs()
+    assert revert_labels(fake, [lrow("China", "L1")], log, dry_run=True) == 1
+    assert fake.removed == []
+
+
+def test_revert_already_absent_label_counts_as_done():
+    """OpenCTI's relationDelete is a no-op for an edge that is already gone."""
+    class Quiet(RevertFake):
+        def __init__(self) -> None:
+            super().__init__()
+            self.on_report: set[tuple[str, str]] = set()
+
+        def remove_label_from_report(self, rid: str, label_id: str) -> None:
+            self.on_report.discard((rid, label_id))
+
+    fake = Quiet()
+    retain: list[dict[str, Any]] = []
+    _lines, log = logs()
+    assert revert_labels(fake, [lrow("China", "L1")], log, retain=retain) == 1
+    assert retain == []

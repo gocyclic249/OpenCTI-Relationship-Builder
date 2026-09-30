@@ -4,6 +4,7 @@ from octirb.ledger import (
     alias_row,
     containment_row,
     entity_row,
+    label_row,
     merge_ledger,
     relationship_row,
     row_key,
@@ -228,3 +229,39 @@ def test_row_key_unknown_kind_raises():
 def test_alias_row_requires_alias():
     with pytest.raises(ValueError):
         alias_row(entity_id="e1", entity_name="x", alias="", preexisted=False, evidence="q")
+
+
+def lab(**over):
+    base = {"report_id": "r1", "label": "China", "label_id": "L1", "source": "country",
+            "source_entity": "China", "preexisted": False}
+    base.update(over)
+    return label_row(**base)
+
+
+def test_label_row_key_is_casefolded_label():
+    assert row_key(lab()) == ("label", "r1", "china")
+    assert row_key(lab(label="CHINA")) == row_key(lab())
+
+
+def test_label_row_rejects_bad_source_and_missing_fields():
+    with pytest.raises(ValueError):
+        lab(source="region")
+    with pytest.raises(ValueError):
+        lab(label="")
+    with pytest.raises(ValueError):
+        lab(report_id="")
+
+
+def test_label_row_allows_null_label_id_when_preexisted():
+    row = lab(label_id=None, preexisted=True)
+    assert row["label_id"] is None and row["preexisted"] is True
+
+
+def test_merge_keeps_prior_owned_label_over_fresh_preexisted():
+    """Review Focus 4: a re-apply after a crash sees our own label already on
+    the report and stamps it preexisted; the prior (owned) row must win or
+    revert would never remove it."""
+    prior = [lab(label_id="L1", preexisted=False)]
+    fresh = [lab(label_id=None, preexisted=True)]
+    merged = merge_ledger(prior, fresh)
+    assert merged == prior

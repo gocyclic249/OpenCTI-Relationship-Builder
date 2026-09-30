@@ -26,7 +26,7 @@ prefix = "AI-"                     # every label this tool writes starts with th
 color = "#0d7d8c"                  # hex color for labels this tool creates
 
 [selection]
-since_days = 183                   # only consider reports published in the last N days; 0 = no limit
+since_days = 183                   # only consider reports published in the last N days; 0 = no limit; report-labels ignores it (use `select --since-days`)
 sources = []                       # report author names to include; [] = all authors
 exclude_sources = []               # report author names to skip entirely
 exclude_title_patterns = []        # case-insensitive regexes; a matching report title is skipped
@@ -61,3 +61,7 @@ alias_writeback = true                 # write stated actor-name equivalences ba
 
 [vulns]
 enabled = true                     # allow the report-vuln linker (CVE regex + exact lookup)
+
+[report_labels]
+enabled = true                         # allow select --linker report-labels
+color = "#5b6abf"                      # #RRGGBB for country/sector value labels this tool creates
