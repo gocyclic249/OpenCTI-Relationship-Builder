@@ -113,6 +113,27 @@ REPORT_OBJECT_IDS_Q = """query($id: String!, $after: ID) { report(id: $id) {
     edges { node { ... on BasicObject { id } ... on BasicRelationship { id } } }
   } } }"""
 
+REPORT_LABEL_SOURCES_Q = """query($id: String!, $after: ID) { report(id: $id) {
+  id name
+  objectLabel { value }
+  objects(first: 500, after: $after, types: ["Country", "Sector"]) {
+    pageInfo { endCursor hasNextPage }
+    edges { node {
+      ... on Country { id name entity_type }
+      ... on Sector { id name entity_type }
+    } }
+  } } }"""
+
+SECTOR_PARENTS_Q = """query($after: ID) { sectors(first: 500, after: $after) {
+  pageInfo { endCursor hasNextPage }
+  edges { node { id name parentSectors { edges { node { id } } } } }
+} }"""
+
+FIND_LABEL_Q = """query($s: String) { labels(first: 100, search: $s) {
+  edges { node { id value } } } }"""
+
+LABEL_SOURCE_TYPES = frozenset({"Country", "Sector"})
+
 REPORT_ACTORS_Q = """query($id: String!) { report(id: $id) {
   id name published
   objects(first: 500, types: ["Intrusion-Set", "Threat-Actor-Group"]) { edges { node {
@@ -265,6 +286,40 @@ class Client:
             after = conn["pageInfo"]["endCursor"]
         raise OpenCTIError(f"report {report_id} objects exceeded {MAX_PAGES} pages")
 
+    @staticmethod
+    def _label_source_nodes(edges: list[JsonDict], out: dict[str, list[JsonDict]]) -> None:
+        """Sort one page of Country/Sector object edges into `out`."""
+        for edge in edges:
+            node = edge.get("node") or {}
+            kind = node.get("entity_type")
+            if kind in LABEL_SOURCE_TYPES and node.get("id"):
+                out[str(kind)].append({"id": str(node["id"]), "name": str(node.get("name") or "")})
+
+    def report_label_sources(self, report_id: str) -> JsonDict:
+        """A report's contained Countries and Sectors, plus its label values.
+
+        Paginated to the end: a truncated read would miss a country and, worse
+        for apply, report a label as absent.
+        """
+        if not report_id:
+            raise OpenCTIError("report_label_sources() needs a report id")
+        found: dict[str, list[JsonDict]] = {"Country": [], "Sector": []}
+        after: str | None = None
+        for _page in range(MAX_PAGES):
+            report = self.gql(REPORT_LABEL_SOURCES_Q, {"id": report_id, "after": after})["report"]
+            if report is None:
+                raise OpenCTIError(f"report {report_id} not found")
+            conn = report["objects"]
+            self._label_source_nodes(conn["edges"], found)
+            if not conn["pageInfo"]["hasNextPage"]:
+                return {
+                    "id": report_id, "name": str(report.get("name") or ""),
+                    "labels": [str(lab["value"]) for lab in (report.get("objectLabel") or [])],
+                    "countries": found["Country"], "sectors": found["Sector"],
+                }
+            after = conn["pageInfo"]["endCursor"]
+        raise OpenCTIError(f"report {report_id} objects exceeded {MAX_PAGES} pages")
+
     LOCATIONS_Q = """
     query($after: ID) {
       countries(first: 100, after: $after) {
@@ -330,6 +385,34 @@ class Client:
         if node is None:
             return []
         return [str(label["value"]) for label in (node.get("objectLabel") or [])]
+
+    def sector_parents(self) -> list[JsonDict]:
+        """Every platform sector (any author) with its parent sector ids."""
+        rows = [
+            {
+                "id": str(n["id"]), "name": str(n["name"]),
+                "parent_ids": [str(e["node"]["id"]) for e in (n.get("parentSectors") or {}).get("edges", [])],
+            }
+            for n in self.paginate(SECTOR_PARENTS_Q, "sectors")
+        ]
+        if any(not r["id"] for r in rows):
+            raise OpenCTIError("sector_parents: a sector came back without an id")
+        return rows
+
+    def find_label(self, value: str) -> str | None:
+        """Id of the label equal to `value` ignoring case, exact case preferred.
+
+        `labels(search:)` is a fuzzy match, so every hit is re-checked here --
+        `octi-geo-ics` must not stand in for `ICS`.
+        """
+        if not value.strip():
+            raise OpenCTIError("find_label() needs a value")
+        nodes = [e["node"] for e in self.gql(FIND_LABEL_Q, {"s": value})["labels"]["edges"]]
+        exact = [n for n in nodes if n["value"] == value]
+        folded = [n for n in nodes if str(n["value"]).casefold() == value.casefold()]
+        for node in [*exact, *folded]:
+            return str(node["id"])
+        return None
 
     # ------------------------------------------------------------------ writes
 
