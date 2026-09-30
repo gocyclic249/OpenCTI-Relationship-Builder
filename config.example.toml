@@ -26,7 +26,7 @@ prefix = "AI-"                     # every label this tool writes starts with th
 color = "#0d7d8c"                  # hex color for labels this tool creates
 
 [selection]
-since_days = 183                   # only consider reports published in the last N days; 0 = no limit
+since_days = 183                   # only consider reports published in the last N days; 0 = no limit; report-labels ignores it (use `select --since-days`)
 sources = []                       # report author names to include; [] = all authors
 exclude_sources = []               # report author names to skip entirely
 exclude_title_patterns = []        # case-insensitive regexes; a matching report title is skipped

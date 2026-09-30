@@ -113,6 +113,8 @@ def _sector_labels(
     """(root name, contained sector name) per contained sector. A sector whose
     walk fails is logged and contributes nothing -- the report's other labels
     still apply."""
+    if not isinstance(report["sectors"], list):
+        raise TypeError("_sector_labels: report['sectors'] must be a list")
     pairs: list[tuple[str, str]] = []
     for sector in report["sectors"]:
         sid, name = str(sector["id"]), str(sector["name"])
@@ -122,6 +124,9 @@ def _sector_labels(
             log(f"  ! {report['id']} sector {name} ({sid}): {exc}"[:200])
             continue
         pairs.extend((root, name) for root in sorted(roots))
+    known = {str(sector["name"]) for sector in report["sectors"]}
+    if any(name not in known for _root, name in pairs):
+        raise RuntimeError("_sector_labels paired a sector the report does not contain")
     return pairs
 
 
@@ -266,6 +271,8 @@ class _LabelState:
 
 def _label_id(state: _LabelState, label: str) -> str:
     """Reuse a platform label equal ignoring case; create one only if none."""
+    if not label.strip():
+        raise ValueError("_label_id: label must not be blank")
     key = label.casefold()
     if key not in state.ids:
         found = state.client.find_label(label)
@@ -283,15 +290,41 @@ def _row(item: JsonDict, label_id: str | None, *, preexisted: bool) -> JsonDict:
     )
 
 
+def _checked(row: JsonDict, item: JsonDict) -> JsonDict:
+    """Post-condition: `row` describes `item`, and a preexisted row claims no label id."""
+    if row["report_id"] != item["report_id"] or row["label"].casefold() != item["label"].casefold():
+        raise RuntimeError("_apply_one built a row for a different report/label")
+    if row["preexisted"] and row["label_id"] is not None:
+        raise RuntimeError("_apply_one claimed a label id on a preexisted row")
+    return row
+
+
+def _dry_run_note(state: _LabelState, rid: str, label: str) -> None:
+    """Preview only: a read-only lookup says whether the label is reused or new."""
+    key = label.casefold()
+    try:
+        found = state.ids.get(key) or state.client.find_label(label)
+    except OpenCTIError as exc:
+        state.log(f"  ! label lookup {rid} {label}: {exc}"[:200])
+        return
+    if found:
+        state.ids[key] = found
+    state.log(f"  would label {rid}: {label} ({'existing' if found else 'new'} label)")
+
+
 def _apply_one(state: _LabelState, item: JsonDict, current: set[str]) -> JsonDict | None:
     """One label onto one report. None when the write failed (logged)."""
-    rid, label = str(item["report_id"]), str(item["label"])
+    if not isinstance(item.get("report_id"), str) or not item["report_id"]:
+        raise ValueError("_apply_one: report_id must be a non-empty string")
+    if not isinstance(item.get("label"), str) or not item["label"]:
+        raise ValueError("_apply_one: label must be a non-empty string")
+    rid, label = item["report_id"], item["label"]
     if label.casefold() in current:
         state.log(f"  keep {label} on {rid} (pre-existed)")
-        return _row(item, None, preexisted=True)
+        return _checked(_row(item, None, preexisted=True), item)
     if state.dry_run:
-        state.log(f"  would label {rid}: {label}")
-        return _row(item, None, preexisted=False)
+        _dry_run_note(state, rid, label)
+        return _checked(_row(item, None, preexisted=False), item)
     try:
         label_id = _label_id(state, label)
         state.client.add_label_to_report(rid, label_id)
@@ -299,7 +332,7 @@ def _apply_one(state: _LabelState, item: JsonDict, current: set[str]) -> JsonDic
         state.log(f"  ! label {rid} {label}: {exc}"[:200])
         return None
     current.add(label.casefold())
-    return _row(item, label_id, preexisted=False)
+    return _checked(_row(item, label_id, preexisted=False), item)
 
 
 def apply_labels(  # noqa: PLR0913 - client/items/log/color/dry_run/save, not a data clump
@@ -345,7 +378,11 @@ def revert_labels(
 ) -> int:
     """Undo `apply_labels`' `"label"` rows. Preexisted rows are left alone; a
     removal that raises is appended to `retain` so the caller keeps it in the
-    ledger for a retry. Label objects themselves are never deleted."""
+    ledger for a retry. Label objects themselves are never deleted.
+
+    A label already gone from the report counts as reverted: this relies on
+    OpenCTI's `relationDelete` being a no-op for an absent object-label edge
+    (the same assumption as `revert_containment`)."""
     if not isinstance(rows, list):
         raise TypeError("revert_labels: rows must be a list")
     failed = retain if retain is not None else []

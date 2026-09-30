@@ -335,9 +335,44 @@ def test_apply_failed_write_not_ledgered():
 
 def test_apply_dry_run_writes_nothing():
     fake = ApplyFake()
-    rows, saves, _ = run_apply(fake, [ext()], dry_run=True)
+    rows, saves, lines = run_apply(fake, [ext()], dry_run=True)
     assert fake.added == [] and fake.created == [] and saves == []
     assert rows[0]["preexisted"] is False
+    assert any("would label r1: China (new label)" in line for line in lines)
+
+
+def test_apply_dry_run_reports_existing_label():
+    fake = ApplyFake(platform={"ics": "L-ics"})
+    rows, saves, lines = run_apply(fake, [ext(label="ICS", **{"from": "sector"})], dry_run=True)
+    assert any("would label r1: ICS (existing label)" in line for line in lines)
+    assert fake.created == [] and fake.added == [] and saves == []
+    assert rows[0]["preexisted"] is False
+
+
+def test_apply_dry_run_find_label_error_still_yields_row():
+    class Boom(ApplyFake):
+        def find_label(self, _value: str) -> str | None:
+            raise OpenCTIError("lookup down")
+
+    fake = Boom()
+    rows, _saves, lines = run_apply(fake, [ext()], dry_run=True)
+    assert len(rows) == 1 and fake.created == [] and fake.added == []
+    assert any("lookup down" in line for line in lines)
+
+
+@pytest.mark.parametrize("bad", [
+    ext(label=""), ext(label=" "), ext(report_id=""), ext(label=None),
+])
+def test_apply_rejects_malformed_item(bad):
+    with pytest.raises(ValueError):
+        run_apply(ApplyFake(), [bad])
+
+
+def test_labels_for_rejects_non_list_sectors():
+    report = {"id": "r1", "name": "R", "labels": [], "countries": [], "sectors": "Energy"}
+    _lines, log = logs()
+    with pytest.raises(TypeError):
+        labels_for(report, {}, {}, log)
 
 
 # -- revert ----------------------------------------------------------------------
@@ -380,3 +415,20 @@ def test_revert_dry_run_removes_nothing():
     _lines, log = logs()
     assert revert_labels(fake, [lrow("China", "L1")], log, dry_run=True) == 1
     assert fake.removed == []
+
+
+def test_revert_already_absent_label_counts_as_done():
+    """OpenCTI's relationDelete is a no-op for an edge that is already gone."""
+    class Quiet(RevertFake):
+        def __init__(self) -> None:
+            super().__init__()
+            self.on_report: set[tuple[str, str]] = set()
+
+        def remove_label_from_report(self, rid: str, label_id: str) -> None:
+            self.on_report.discard((rid, label_id))
+
+    fake = Quiet()
+    retain: list[dict[str, Any]] = []
+    _lines, log = logs()
+    assert revert_labels(fake, [lrow("China", "L1")], log, retain=retain) == 1
+    assert retain == []
