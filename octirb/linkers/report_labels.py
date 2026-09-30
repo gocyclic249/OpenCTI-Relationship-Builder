@@ -15,10 +15,17 @@ only labels its own run added.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from ..client import JsonDict
+from .. import pipeline
+from ..client import JsonDict, OpenCTIError
+
+if TYPE_CHECKING:
+    from ..client import Client
+    from ..config import Config
 
 Log = Callable[[str], None]
 
@@ -139,4 +146,68 @@ def labels_for(
         out.append(_extraction(report, label, source, entity))
     if len({str(e["label"]).casefold() for e in out}) != len(out):
         raise RuntimeError("labels_for emitted a duplicate label")
+    return out
+
+
+def _log_select(log: Log, counts: dict[str, int], selected: int) -> None:
+    log(
+        f"  selected {selected} report(s); skipped {counts['empty']} empty, {counts['old']} old, "
+        f"{counts['excluded_source']} excluded source, {counts['excluded_title']} excluded title"
+    )
+
+
+def select(
+    client: Client, cfg: Config, log: Log, *, limit: int | None, since: str | None
+) -> list[JsonDict]:
+    """Reports that contain at least one object, newest first.
+
+    Unlike `pipeline.select`, a report with no text is kept -- labels need
+    none -- and no text tier is planned. Source/title/since gates are the
+    shared `pipeline.basic_skip`.
+    """
+    if limit is not None and limit <= 0:
+        raise ValueError("select: limit must be a positive int or None")
+    sel = cfg.selection
+    title_res = tuple(re.compile(p, re.IGNORECASE) for p in sel.exclude_title_patterns)
+    since_value = since
+    if since_value is None and sel.since_days > 0:
+        since_value = pipeline.since_from_days(sel.since_days)
+    counts = {"old": 0, "excluded_source": 0, "excluded_title": 0, "empty": 0}
+    out: list[JsonDict] = []
+    for node in client.reports():
+        if pipeline.basic_skip(node, since=since_value, empty_only=False, sel=sel,
+                               title_res=title_res, counts=counts):
+            continue
+        if not node["objects"]["edges"]:
+            counts["empty"] += 1
+            continue
+        out.append({"report_id": str(node["id"]), "name": str(node.get("name") or ""),
+                    "source": pipeline.source_name(node)})
+        if limit and len(out) >= limit:
+            break
+    _log_select(log, counts, len(out))
+    if limit and len(out) > limit:
+        raise RuntimeError("select returned more reports than its limit")
+    return out
+
+
+def batch(client: Client, cfg: Config, selection: list[JsonDict], log: Log) -> list[JsonDict]:
+    """Extractions for every selected report. A report that errors (deleted
+    since select, page cap) is logged and skipped; the batch continues."""
+    if not isinstance(selection, list):
+        raise TypeError("batch: selection must be a list")
+    index = build_sector_index(client.sector_parents())
+    aliases = {k.casefold(): v for k, v in cfg.sectors.aliases.items()}
+    out: list[JsonDict] = []
+    for item in selection:
+        rid = str(item["report_id"])
+        try:
+            report = client.report_label_sources(rid)
+        except OpenCTIError as exc:
+            log(f"  ! {rid}: {exc}"[:200])
+            continue
+        out.extend(labels_for(report, index, aliases, log))
+    wanted = {str(s["report_id"]) for s in selection}
+    if any(str(e["report_id"]) not in wanted for e in out):
+        raise RuntimeError("batch emitted a label for a report outside the selection")
     return out

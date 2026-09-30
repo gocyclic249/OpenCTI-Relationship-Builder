@@ -91,11 +91,11 @@ def _existing_files(ref: JsonDict | None) -> list[str]:
     return [e["node"]["name"] for e in ref.get("importFiles", {}).get("edges", [])]
 
 
-def _source_name(node: JsonDict) -> str:
+def source_name(node: JsonDict) -> str:
     return (node.get("createdBy") or {}).get("name") or "<none>"
 
 
-def _since_from_days(since_days: int) -> str:
+def since_from_days(since_days: int) -> str:
     """ISO date `since_days` before today -- the default cutoff when the
     caller does not pass an explicit `since`."""
     return (date.today() - timedelta(days=since_days)).isoformat()
@@ -116,7 +116,7 @@ def _downgrade_fetch_tier(tier: str, *, host: str | None, source: str, cfg: Text
     return tier
 
 
-def _basic_skip(  # noqa: PLR0913 - keyword-only selection-loop gates, not a data clump
+def basic_skip(  # noqa: PLR0913 - keyword-only selection-loop gates, not a data clump
     node: JsonDict,
     *,
     since: str | None,
@@ -135,7 +135,7 @@ def _basic_skip(  # noqa: PLR0913 - keyword-only selection-loop gates, not a dat
             return True
     if empty_only and node["objects"]["edges"]:
         return True
-    source = _source_name(node)
+    source = source_name(node)
     if sel.sources and source not in sel.sources:
         return True
     if source in sel.exclude_sources:
@@ -160,10 +160,10 @@ def _select_one(  # noqa: PLR0913 - keyword-only selection-loop gates, not a dat
     counts: dict[str, int],
 ) -> Selected | None:
     """One report -> a `Selected`, or None with the matching counter bumped."""
-    if _basic_skip(node, since=since, empty_only=empty_only, sel=sel, title_res=title_res,
+    if basic_skip(node, since=since, empty_only=empty_only, sel=sel, title_res=title_res,
                     counts=counts):
         return None
-    source = _source_name(node)
+    source = source_name(node)
     ref, host = _best_reference(node)
     desc_len = len(node.get("description") or "")
     existing_files = _existing_files(ref)
@@ -238,7 +238,7 @@ def select(  # noqa: PLR0913 - keyword-only selection options, not a data clump
     title_res = tuple(re.compile(p, re.IGNORECASE) for p in sel.exclude_title_patterns)
     since_value = since
     if since_value is None and sel.since_days > 0:
-        since_value = _since_from_days(sel.since_days)
+        since_value = since_from_days(sel.since_days)
 
     out: list[Selected] = []
     counts = {"old": 0, "excluded_source": 0, "excluded_title": 0, "downgraded": 0, "no_text": 0}
