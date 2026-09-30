@@ -67,6 +67,14 @@ def _build_actor_target(client: Client, cfg: Config) -> Resolver:
     )
 
 
+def _build_report_labels(client: Client, cfg: Config) -> Resolver:
+    """report-labels has no resolver: it labels with the names of objects the
+    report already contains, so there is nothing to resolve."""
+    raise NotImplementedError(
+        "report-labels resolves nothing -- see octirb.linkers.report_labels"
+    )
+
+
 REGISTRY: dict[str, Linker] = {
     "report-location": Linker(
         name="report-location",
@@ -111,6 +119,20 @@ REGISTRY: dict[str, Linker] = {
         write_kind="containment",
         needs_model=False,
         build_resolver=_build_vulns,
+        contract=None,
+    ),
+    "report-labels": Linker(
+        name="report-labels",
+        key_field="label",
+        # Label sources ("country"/"sector") are checked by
+        # report_labels.validate against ledger.LABEL_SOURCES, not by the
+        # pipeline's generic role check.
+        roles=frozenset(),
+        label_suffix="Labels",
+        entity_kind="Label",
+        write_kind="label",
+        needs_model=False,
+        build_resolver=_build_report_labels,
         contract=None,
     ),
     "actor-target": Linker(

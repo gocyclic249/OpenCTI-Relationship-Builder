@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any
 from . import config, ledger, pipeline, structured, writer
 from .client import Client, JsonDict, OpenCTIError
 from .config import Config
-from .linkers import REGISTRY, actor_target, get, report_vuln
+from .linkers import REGISTRY, actor_target, get, report_labels, report_vuln
 from .linkers.base import Linker
 from .resolvers import crosswalk
 from .resolvers.gazetteer import Gazetteer
@@ -71,6 +71,11 @@ def _select_write(client: Client, cfg: Config, run: Run, args: Namespace) -> int
         )
         run.write_json("selection.json", packets)
         return len(packets)
+    if args.linker == "report-labels":
+        label_since = _since_iso(args.since_days) if args.since_days else None
+        rows = report_labels.select(client, cfg, _log, limit=args.limit, since=label_since)
+        run.write_json("selection.json", rows)
+        return len(rows)
     cache = TextCache(cfg.cache_dir)
     since = _since_iso(args.since_days) if args.since_days else None
     selection = pipeline.select(
@@ -86,6 +91,10 @@ def cmd_select(args: Namespace) -> int:
     cfg = _load_cfg(args)
     if args.linker == "report-vuln" and not cfg.vulns.enabled:
         raise SystemExit("config: report-vuln is disabled ([vulns].enabled)")
+    if args.linker == "report-labels" and not cfg.report_labels.enabled:
+        raise SystemExit("config: report-labels is disabled ([report_labels].enabled)")
+    if args.linker == "report-labels" and args.all_reports:
+        _log("select: --all-reports does not apply to report-labels; ignored")
     if args.linker == "actor-target" and args.source not in ("description", "report"):
         _log("select --linker actor-target requires --source description|report")
         return EXIT_BAD_RUN
@@ -122,8 +131,8 @@ def cmd_select(args: Namespace) -> int:
 def cmd_fetch(args: Namespace) -> int:
     cfg = _load_cfg(args)
     run = Run.open(cfg.runs_dir, args.run_id)
-    if run.linker() == "actor-target":
-        _log(f"run {run.run_id} is actor-target; it has no fetch step")
+    if run.linker() in ("actor-target", "report-labels"):
+        _log(f"run {run.run_id} is {run.linker()}; it has no fetch step")
         return EXIT_BAD_RUN
     selection = pipeline.from_dicts(run.read_json("selection.json"))
     client = _client(cfg)
@@ -143,6 +152,13 @@ def _batch_vuln(run: Run, cfg: Config) -> int:
     selection = pipeline.from_dicts(run.read_json("selection.json"))
     batch = pipeline.build_batch(cache, selection)
     extractions = report_vuln.build_extractions(batch)
+    run.write_json("extractions.json", extractions)
+    print(f"run {run.run_id}: {len(extractions)} extraction(s) written")
+    return EXIT_OK
+
+
+def _batch_labels(run: Run, cfg: Config) -> int:
+    extractions = report_labels.batch(_client(cfg), cfg, run.read_json("selection.json"), _log)
     run.write_json("extractions.json", extractions)
     print(f"run {run.run_id}: {len(extractions)} extraction(s) written")
     return EXIT_OK
@@ -175,6 +191,8 @@ def cmd_batch(args: Namespace) -> int:
     linker_name = run.linker()
     if linker_name == "report-vuln":
         return _batch_vuln(run, cfg)
+    if linker_name == "report-labels":
+        return _batch_labels(run, cfg)
     linker = get(linker_name)
     if not linker.needs_model:
         raise RuntimeError(f"batch: linker {linker_name!r} has no batch step")
@@ -274,10 +292,13 @@ def cmd_validate(args: Namespace) -> int:
         _log(f"{run.root / 'extractions.json'} is corrupt; expected a JSON array")
         return EXIT_BAD_RUN
     linker_name = run.linker()
-    client = _client(cfg)
-    if linker_name == "actor-target":
-        auto, review = _validate_actor_target(cfg, run, client, raw)
+    if linker_name == "report-labels":
+        selection_ids = {str(s["report_id"]) for s in run.read_json("selection.json")}
+        auto, review = report_labels.validate(raw, selection_ids)
+    elif linker_name == "actor-target":
+        auto, review = _validate_actor_target(cfg, run, _client(cfg), raw)
     else:
+        client = _client(cfg)
         linker = get(linker_name)
         resolver = linker.build_resolver(client, cfg)
         selection_ids = {str(s["report_id"]) for s in run.read_json("selection.json")}
@@ -290,6 +311,29 @@ def cmd_validate(args: Namespace) -> int:
 
 
 # ---------------------------------------------------------------------- apply
+
+
+def _apply_labels_cmd(args: Namespace, cfg: Config, run: Run, client: Client) -> int:
+    auto = run.read_json("auto.json") if run.has("auto.json") else []
+    review = run.read_json("review.json") if run.has("review.json") else []
+    items = list(auto)
+    if args.include_review:
+        items += [r for r in review if not r.get("hard_fail")]
+    prior = run.read_json("applied.json") if run.has("applied.json") else []
+
+    def save(fresh: list[JsonDict]) -> None:
+        run.write_json("applied.json", ledger.merge_ledger(prior, fresh))
+
+    rows = report_labels.apply_labels(
+        client, items, _log, color=cfg.report_labels.color, dry_run=args.dry_run, save=save
+    )
+    merged = ledger.merge_ledger(prior, rows)
+    if not args.dry_run:
+        run.write_json("applied.json", merged)
+    written = sum(1 for r in rows if not r["preexisted"])
+    verb = "would write" if args.dry_run else "wrote"
+    print(f"run {run.run_id}: {verb} {written} label(s) ({len(merged)} total in ledger)")
+    return EXIT_OK
 
 
 def _apply_containment_cmd(
@@ -354,6 +398,8 @@ def cmd_apply(args: Namespace) -> int:
         return EXIT_BAD_RUN
     linker = get(linker_name)
     client = _client(cfg)
+    if linker.write_kind == "label":
+        return _apply_labels_cmd(args, cfg, run, client)
     if linker.write_kind == "containment":
         return _apply_containment_cmd(args, cfg, run, linker, client)
     return _apply_relationship_cmd(args, cfg, run, client)
@@ -419,6 +465,7 @@ def cmd_revert(args: Namespace) -> int:
     retain: list[JsonDict] = []
     n_contain = pipeline.revert_containment(client, rows, _log, dry_run=args.dry_run, retain=retain)
     n_alias = pipeline.revert_aliases(client, rows, _log, dry_run=args.dry_run, retain=retain)
+    n_label = report_labels.revert_labels(client, rows, _log, dry_run=args.dry_run, retain=retain)
     n_rel_del, n_rel_kept = _revert_relationships(args, cfg, client, rows)
     n_ent_del, n_ent_kept = _revert_entities(args, cfg, client, rows, retain)
     owned, done = _split_reverted(rows, retain)
@@ -430,7 +477,7 @@ def cmd_revert(args: Namespace) -> int:
         run.write_json("reverted.json", [*prior_reverted, *done])
         run.write_json("applied.json", owned)
     print(
-        f"run {run.run_id}: containment {n_contain}, aliases {n_alias}, "
+        f"run {run.run_id}: containment {n_contain}, aliases {n_alias}, labels {n_label}, "
         f"relationships {n_rel_del}/{n_rel_kept} kept, entities {n_ent_del}/{n_ent_kept} kept"
     )
     if owned and not args.dry_run:
@@ -532,7 +579,7 @@ def _doctor_sectors(client: Client, cfg: Config) -> bool:
 def _doctor_linkers(client: Client, cfg: Config) -> bool:
     ok = True
     for name in sorted(REGISTRY):
-        if not name.startswith("report-"):
+        if not name.startswith("report-") or REGISTRY[name].write_kind != "containment":
             continue
         linker = REGISTRY[name]
         try:
