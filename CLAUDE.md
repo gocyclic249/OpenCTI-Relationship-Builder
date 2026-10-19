@@ -21,7 +21,7 @@ shellcheck install-deps.sh
 ./install-deps.sh --check                  # report dev-tool presence only
 ```
 
-Pipeline order: `select --linker <name>` → `fetch` → `batch` (→ optional `structured`) → *model writes `extractions.json`* → `validate` → `apply [--dry-run]` → `revert [--dry-run]`. Every pipeline command takes `--run-id` (for `select` it names a new run; otherwise defaults to the most recent run). `status`, `doctor`, `crosswalk` are not run-scoped. Config is resolved `--config` → `$OCTI_RB_CONFIG` → `./config.toml`; the API token comes only from `$OPENCTI_TOKEN`/`$OPENCTI_ADMIN_TOKEN` or `[platform].env_file`, never from the TOML.
+Pipeline order: `select --linker <name>` → `fetch` → `batch` (→ optional `structured`) → *model writes `extractions.json`* → `validate` → `apply [--dry-run]` → `revert [--dry-run]`. Every pipeline command takes `--run-id` (for `select` it names a new run; otherwise defaults to the most recent run). `status`, `doctor`, `crosswalk`, `tui` are not run-scoped. `tui` (`octirb/tui/`: `state.py` pure model, `runner.py` subprocess per step via `python -m octirb`, `screen.py` curses, `wave.py` pure update-all wave state machine (select→validate per linker, never apply), `extract.py` locked-down `claude -p` argv + stream-json condensing for the extract step) drives the same commands; its review screen writes `picks.json`, which `apply --include-review` honours through `octirb/picks.py` (absent file = every non-hard_fail item, as before). Config is resolved `--config` → `$OCTI_RB_CONFIG` → `./config.toml`; the API token comes only from `$OPENCTI_TOKEN`/`$OPENCTI_ADMIN_TOKEN` or `[platform].env_file`, never from the TOML.
 
 ## Architecture
 

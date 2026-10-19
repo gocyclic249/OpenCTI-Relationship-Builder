@@ -1,7 +1,7 @@
 """Command line entry point for octi-rb.
 
 Wires every earlier task's module into the run pipeline: doctor, select,
-fetch, structured, batch, validate, apply, revert, status, crosswalk.
+fetch, structured, batch, validate, apply, revert, status, crosswalk, tui.
 
 Data to stdout, diagnostics to stderr. Exit codes: 0 ok, 1 platform/doctor
 failure, 2 bad run/config state. Ported from
@@ -21,7 +21,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import config, ledger, pipeline, structured, writer
+from . import config, ledger, picks, pipeline, structured, writer
 from .client import Client, JsonDict, OpenCTIError
 from .config import Config
 from .linkers import REGISTRY, actor_target, get, report_labels, report_vuln
@@ -60,14 +60,48 @@ def _since_iso(since_days: int) -> str:
     return (datetime.now(UTC) - timedelta(days=since_days)).date().isoformat()
 
 
-def _select_write(client: Client, cfg: Config, run: Run, args: Namespace) -> int:
+def _report_ids_from_runs(runs_dir: Path, run_ids: list[str]) -> frozenset[str] | None:
+    """Union of `report_id` over the named runs' selection.json rows.
+
+    A run whose selection.json is missing, unreadable, or not a list is
+    logged and skipped (a failed wave-1 select must not crash wave 2).
+    None means no named run was readable.
+    """
+    if not isinstance(runs_dir, Path):
+        raise TypeError("_report_ids_from_runs: runs_dir must be a Path")
+    if not run_ids:
+        raise ValueError("_report_ids_from_runs: run_ids must not be empty")
+    ids: set[str] = set()
+    readable = 0
+    for run_id in run_ids:
+        try:
+            rows = json.loads((runs_dir / run_id / "selection.json").read_text())
+        except (OSError, ValueError):
+            rows = None
+        if not isinstance(rows, list):
+            _log(f"select: run {run_id} has no readable selection.json; skipped")
+            continue
+        readable += 1
+        ids.update(
+            str(row["report_id"]) for row in rows
+            if isinstance(row, dict) and row.get("report_id")
+        )
+    if readable == 0:
+        return None
+    return frozenset(ids)
+
+
+def _select_write(
+    client: Client, cfg: Config, run: Run, args: Namespace,
+    only_ids: frozenset[str] | None = None,
+) -> int:
     """Write selection.json and return the count of items selected."""
     if args.linker == "actor-target":
         cache = TextCache(cfg.cache_dir)
         packets = (
             actor_target.select_description(client, args.limit)
             if args.source == "description"
-            else actor_target.select_report(client, cache, cfg, args.limit)
+            else actor_target.select_report(client, cache, cfg, args.limit, only_ids=only_ids)
         )
         run.write_json("selection.json", packets)
         return len(packets)
@@ -100,6 +134,15 @@ def cmd_select(args: Namespace) -> int:
         return EXIT_BAD_RUN
     if args.linker == "actor-target" and (args.since_days or args.all_reports):
         _log("select: --since-days/--all-reports do not apply to actor-target; ignored")
+    only_ids: frozenset[str] | None = None
+    if args.reports_from_run:
+        if not (args.linker == "actor-target" and args.source == "report"):
+            _log("select: --reports-from-run only applies to actor-target --source report")
+            return EXIT_BAD_RUN
+        only_ids = _report_ids_from_runs(cfg.runs_dir, args.reports_from_run)
+        if only_ids is None:
+            _log("select: none of the --reports-from-run runs has a readable selection.json")
+            return EXIT_BAD_RUN
     runs_dir = cfg.runs_dir
     if args.run_id and (runs_dir / args.run_id / META).is_file():
         _log(f"run {args.run_id} already exists in {runs_dir} — choose a new --run-id or omit it")
@@ -107,7 +150,7 @@ def cmd_select(args: Namespace) -> int:
     config.check_disk(cfg, _log)
     client = _client(cfg)
     run = Run(runs_dir / (args.run_id or new_run_id()))
-    count = _select_write(client, cfg, run, args)
+    count = _select_write(client, cfg, run, args, only_ids)
     options: JsonDict = {
         "limit": args.limit, "all_reports": args.all_reports, "since_days": args.since_days,
     }
@@ -313,12 +356,22 @@ def cmd_validate(args: Namespace) -> int:
 # ---------------------------------------------------------------------- apply
 
 
+
+def _review_items(run: Run, review: list[JsonDict]) -> list[JsonDict]:
+    """The review items --include-review may write: every soft item, or only
+    the ones picks.json accepts when the run has one (see octirb/picks.py)."""
+    accepted = picks.load_picks(run)
+    chosen = picks.review_to_apply(review, accepted)
+    if accepted is not None:
+        _log(f"picks.json: {len(chosen)} of {len(review)} review item(s) accepted")
+    return chosen
+
 def _apply_labels_cmd(args: Namespace, cfg: Config, run: Run, client: Client) -> int:
     auto = run.read_json("auto.json") if run.has("auto.json") else []
     review = run.read_json("review.json") if run.has("review.json") else []
     items = list(auto)
     if args.include_review:
-        items += [r for r in review if not r.get("hard_fail")]
+        items += _review_items(run, review)
     prior = run.read_json("applied.json") if run.has("applied.json") else []
 
     def save(fresh: list[JsonDict]) -> None:
@@ -343,7 +396,7 @@ def _apply_containment_cmd(
     review = run.read_json("review.json") if run.has("review.json") else []
     approved = list(auto)
     if args.include_review:
-        approved += [r for r in review if not r.get("hard_fail")]
+        approved += _review_items(run, review)
     if args.create_missing:
         resolver = linker.build_resolver(client, cfg)
         approved += pipeline.create_missing(resolver, review, _log, dry_run=args.dry_run, linker=linker)
@@ -368,7 +421,7 @@ def _apply_relationship_cmd(args: Namespace, cfg: Config, run: Run, client: Clie
     review = run.read_json("review.json") if run.has("review.json") else []
     items = list(auto)
     if args.include_review:
-        items += [r for r in review if not r.get("hard_fail")]
+        items += _review_items(run, review)
     prior = run.read_json("applied.json") if run.has("applied.json") else []
     ours = {
         str(r["relationship_id"]): list(r["in_reports"])
@@ -660,6 +713,20 @@ def cmd_crosswalk(args: Namespace) -> int:
     return EXIT_OK
 
 
+
+# ------------------------------------------------------------------------ tui
+
+
+def cmd_tui(args: Namespace) -> int:
+    """Interactive front end: one row per step, a live output pane, and a
+    checkbox list over review.json. Imported lazily so platforms without
+    curses still get every other command."""
+    cfg = _load_cfg(args)
+    from .tui import screen  # noqa: PLC0415 - curses is only needed, and only importable, here
+
+    config_path = Path(args.config) if args.config else None
+    return screen.run_tui(cfg, config_path)
+
 # --------------------------------------------------------------------- parser
 
 
@@ -684,6 +751,10 @@ def build_parser() -> argparse.ArgumentParser:
     select.add_argument("--all-reports", action="store_true", help="clear the default empty_only filter")
     select.add_argument("--since-days", type=int)
     select.add_argument("--source", choices=("description", "report"), help="required for --linker actor-target")
+    select.add_argument(
+        "--reports-from-run", action="append", dest="reports_from_run", metavar="RUN_ID",
+        help="actor-target --source report only: limit to report ids in this run's selection.json (repeatable)",
+    )
 
     _add_common(sub, "fetch", "materialize article text into the shared cache")
     _add_common(sub, "structured", "run deterministic structured-field parsers")
@@ -700,6 +771,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("status", help="summarise every run")
     sub.add_parser("doctor", help="check config, connectivity and resolvers")
+    sub.add_parser("tui", help="interactive terminal front end for the pipeline")
 
     crosswalk_p = sub.add_parser("crosswalk", help="manage the actor synonym cache")
     crosswalk_p.add_argument("action", choices=("refresh",))
@@ -717,6 +789,7 @@ COMMANDS: dict[str, Callable[[Namespace], int]] = {
     "revert": cmd_revert,
     "status": cmd_status,
     "crosswalk": cmd_crosswalk,
+    "tui": cmd_tui,
 }
 
 
