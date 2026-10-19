@@ -327,6 +327,27 @@ def test_report_source_reads_cache_only(tmp_path: Path):
     assert packets[0]["text"] == "some article text"
 
 
+def test_select_report_only_ids_skips_others_without_reading_them(tmp_path: Path):
+    cache = TextCache(tmp_path)
+    cache.write("r1", "text one")
+    cache.write("r2", "text two")
+    actors = [{"actor_id": "a", "name": "A", "entity_type": "Intrusion-Set"}]
+
+    class Recording(FakeReportClient):
+        def __init__(self, table):
+            super().__init__(table)
+            self.calls: list[str] = []
+
+        def report_actors(self, report_id):
+            self.calls.append(report_id)
+            return super().report_actors(report_id)
+
+    client = Recording({rid: {"report_id": rid, "title": rid, "actors": actors} for rid in ("r1", "r2")})
+    packets = select_report(client, cache, Config(), None, only_ids=frozenset({"r2"}))
+    assert [p["source_ref"] for p in packets] == ["r2"]
+    assert client.calls == ["r2"]
+
+
 def test_select_report_respects_limit(tmp_path: Path):
     cache = TextCache(tmp_path)
     cache.write("r1", "text one")

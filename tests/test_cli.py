@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from octirb import cli, ledger
+from octirb import cli, ledger, picks
 from octirb.client import ACTOR_DELETES, OpenCTIError
 from octirb.config import ActorsCfg, Config, ReportLabelsCfg, RunsCfg, SelectionCfg
 from octirb.linkers import REGISTRY
@@ -35,7 +35,7 @@ def ns(**over: Any) -> Namespace:
         "config": None, "run_id": None, "linker": None, "limit": None,
         "all_reports": False, "since_days": None, "source": None,
         "dry_run": False, "include_review": False, "create_missing": False,
-        "action": None,
+        "action": None, "reports_from_run": None,
     }
     base.update(over)
     return Namespace(**base)
@@ -165,6 +165,67 @@ def test_select_unknown_linker_exits(tmp_path: Path, monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(cli, "_load_cfg", lambda _args: cfg)
     with pytest.raises(SystemExit):
         cli.cmd_select(ns(linker="bogus"))
+
+
+def _write_selection(run_dir: Path, rows: Any) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "selection.json").write_text(json.dumps(rows))
+
+
+def test_select_reports_from_run_rejected_for_other_linkers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = make_cfg(tmp_path)
+    monkeypatch.setattr(cli, "_load_cfg", lambda _args: cfg)
+
+    def boom(_cfg: Config) -> Any:
+        raise AssertionError("_client must not be built for a rejected flag combination")
+
+    monkeypatch.setattr(cli, "_client", boom)
+    result = cli.cmd_select(ns(linker="report-location", reports_from_run=["x"]))
+    assert result == cli.EXIT_BAD_RUN
+    result = cli.cmd_select(ns(linker="actor-target", source="description", reports_from_run=["x"]))
+    assert result == cli.EXIT_BAD_RUN
+
+
+def test_select_reports_from_run_scopes_actor_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_selection(tmp_path / "w1", [{"report_id": "r1", "title": "a"}])
+    _write_selection(tmp_path / "w2", [{"report_id": "r1"}, {"report_id": "r3"}])
+    (tmp_path / "w3").mkdir()  # named run whose select failed: no selection.json
+    cfg = make_cfg(tmp_path)
+    monkeypatch.setattr(cli, "_load_cfg", lambda _args: cfg)
+    monkeypatch.setattr(cli, "_client", lambda _cfg: object())
+    seen: list[Any] = []
+
+    def fake_select(_client: Any, _cache: Any, _cfg: Any, _limit: Any, only_ids: Any = None) -> list[Any]:
+        seen.append(only_ids)
+        return []
+
+    monkeypatch.setattr(cli.actor_target, "select_report", fake_select)
+    result = cli.cmd_select(ns(
+        linker="actor-target", source="report", run_id="new1",
+        reports_from_run=["w1", "w2", "w3"],
+    ))
+    assert result == cli.EXIT_OK
+    assert seen == [frozenset({"r1", "r3"})]
+
+
+def test_select_reports_from_run_all_unreadable_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "w1").mkdir()
+    _write_selection(tmp_path / "w2", {"not": "a list"})
+    cfg = make_cfg(tmp_path)
+    monkeypatch.setattr(cli, "_load_cfg", lambda _args: cfg)
+    monkeypatch.setattr(cli, "_client", lambda _cfg: object())
+    result = cli.cmd_select(ns(
+        linker="actor-target", source="report", run_id="new1",
+        reports_from_run=["w1", "w2", "missing"],
+    ))
+    assert result == cli.EXIT_BAD_RUN
+    assert not (tmp_path / "new1" / "meta.json").exists()
 
 
 # --------------------------------------------------------------------- fetch
@@ -351,6 +412,46 @@ def test_apply_containment_merges_ledger(tmp_path: Path, monkeypatch: pytest.Mon
     applied = json.loads((run_dir / "applied.json").read_text())
     assert applied[0]["entity_id"] == "e1"
     assert fake.added_objects == [("r1", "e1")]
+
+
+def test_apply_include_review_honours_picks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """picks.json narrows --include-review to the accepted items; hard_fail stays out even if picked."""
+    run_dir = tmp_path / "r1"
+    write_meta(run_dir, linker="report-location")
+    base = {"report_id": "r1", "iso3": "FRA", "role": "target", "confidence": "medium", "evidence": "q",
+            "review_reasons": ["confidence=medium"], "hard_fail": False}
+    review = [dict(base, entity_id="e1", entity_name="A"), dict(base, entity_id="e2", entity_name="B"),
+              dict(base, entity_id="e3", entity_name="C", hard_fail=True)]
+    (run_dir / "auto.json").write_text(json.dumps([]))
+    (run_dir / "review.json").write_text(json.dumps(review))
+    accepted = [picks.item_key(review[1]), picks.item_key(review[2])]
+    (run_dir / "picks.json").write_text(json.dumps({"accepted": accepted}))
+    cfg = make_cfg(tmp_path)
+    monkeypatch.setattr(cli, "_load_cfg", lambda _args: cfg)
+    fake = ContainmentFakeClient()
+    monkeypatch.setattr(cli, "_client", lambda _cfg: fake)
+
+    assert cli.cmd_apply(ns(run_id="r1", include_review=True)) == cli.EXIT_OK
+    assert fake.added_objects == [("r1", "e2")]
+
+
+def test_apply_include_review_without_picks_takes_every_soft_item(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "r1"
+    write_meta(run_dir, linker="report-location")
+    base = {"report_id": "r1", "iso3": "FRA", "role": "target", "confidence": "medium", "evidence": "q",
+            "review_reasons": ["confidence=medium"], "hard_fail": False}
+    review = [dict(base, entity_id="e1", entity_name="A"), dict(base, entity_id="e2", entity_name="B")]
+    (run_dir / "auto.json").write_text(json.dumps([]))
+    (run_dir / "review.json").write_text(json.dumps(review))
+    cfg = make_cfg(tmp_path)
+    monkeypatch.setattr(cli, "_load_cfg", lambda _args: cfg)
+    fake = ContainmentFakeClient()
+    monkeypatch.setattr(cli, "_client", lambda _cfg: fake)
+
+    assert cli.cmd_apply(ns(run_id="r1", include_review=True)) == cli.EXIT_OK
+    assert fake.added_objects == [("r1", "e1"), ("r1", "e2")]
 
 
 def test_apply_containment_checkpoints_mid_batch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -823,3 +924,20 @@ def test_fetch_refuses_report_labels(tmp_path: Path, monkeypatch: pytest.MonkeyP
 def test_doctor_linkers_skips_report_labels(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "REGISTRY", {"report-labels": REGISTRY["report-labels"]})
     assert cli._doctor_linkers(object(), make_cfg(tmp_path)) is True  # type: ignore[arg-type]
+
+
+def test_tui_dispatches_to_screen(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from octirb.tui import screen
+
+    cfg = make_cfg(tmp_path)
+    monkeypatch.setattr(cli, "_load_cfg", lambda _args: cfg)
+    seen: list[tuple[Any, Any]] = []
+
+    def fake_run_tui(got_cfg: Config, config_path: Path | None) -> int:
+        seen.append((got_cfg, config_path))
+        return cli.EXIT_OK
+
+    monkeypatch.setattr(screen, "run_tui", fake_run_tui)
+    assert cli.cmd_tui(ns(config="/x/c.toml")) == cli.EXIT_OK
+    assert seen == [(cfg, Path("/x/c.toml"))]
+    assert "tui" in cli.COMMANDS

@@ -449,7 +449,10 @@ def select_description(client: Client, limit: int | None) -> list[JsonDict]:
     return result
 
 
-def select_report(client: Client, cache: TextCache, cfg: Config, limit: int | None) -> list[JsonDict]:
+def select_report(
+    client: Client, cache: TextCache, cfg: Config, limit: int | None,
+    only_ids: frozenset[str] | None = None,
+) -> list[JsonDict]:
     """One packet per report that has cached text AND >=1 actor.
 
     Cache-only by design: this reads `cache.text_dir` (already-materialized
@@ -460,7 +463,11 @@ def select_report(client: Client, cache: TextCache, cfg: Config, limit: int | No
     simply yields no packet, rather than triggering a fresh connector run.
     `cfg` is accepted (and validated) for interface symmetry with the
     linker's other config-driven selectors; nothing here is config-tuned yet.
+    When `only_ids` is not None, cached reports outside it are skipped before
+    `client.report_actors` is called (no platform read for them).
     """
+    if only_ids is not None and not isinstance(only_ids, frozenset):
+        raise TypeError("select_report: only_ids must be a frozenset or None")
     if not isinstance(cache, TextCache):
         raise TypeError("select_report: cache must be a TextCache")
     if not isinstance(cfg, Config):
@@ -472,6 +479,8 @@ def select_report(client: Client, cache: TextCache, cfg: Config, limit: int | No
     for report_id in report_ids:
         if limit and len(packets) >= limit:
             break
+        if only_ids is not None and report_id not in only_ids:
+            continue
         info = client.report_actors(report_id)
         if not info or not info.get("actors"):
             continue

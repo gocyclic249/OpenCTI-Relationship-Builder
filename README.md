@@ -105,7 +105,11 @@ dependencies.
    The default skips any report that already contains **any** objects (of
    any type, not only this linker's), so a second linker's default
    `select` skips the reports the first one enriched. Use `--all-reports`
-   for a second linker pass over the same corpus.
+   for a second linker pass over the same corpus. For `actor-target
+   --source report`, `--reports-from-run RUN_ID` (repeatable) limits the
+   selection to the reports in those runs' `selection.json`; runs without
+   a readable selection are skipped, and `select` fails only when none of
+   them has one. The TUI's Wave 2 uses it.
 
 3. **Fetch** article text into the shared cache (report-* linkers only; `report-labels` skips this):
 
@@ -142,7 +146,8 @@ dependencies.
    ```
 
    Add `--include-review` to also apply non-`hard_fail` review items once
-   you've read their evidence, or `--create-missing` (report-actor only)
+   you've read their evidence (or only the ones ticked in the TUI's
+   review screen, when the run has a `picks.json`), or `--create-missing` (report-actor only)
    to mint a missing Intrusion-Set/Threat-Actor-Group at `confidence: high`.
 
 8. **Revert**, if needed — replays this run's ledger in reverse, in a
@@ -152,6 +157,45 @@ dependencies.
    bin/octi-rb revert --dry-run
    bin/octi-rb revert
    ```
+
+**Prefer not to remember the order?** `bin/octi-rb tui` opens a terminal
+front end (stdlib `curses`, no extra install) with one row per step. Move
+to a row and press Enter to run it; the output appears in the pane on the
+right and the `[ok]` marks update from the run directory. `n` starts a new
+run (a small form for the `select` options), `r` switches between runs, and
+`v` opens the review screen: `review.json` as a checkbox list where Space
+ticks the medium/low items you want, `a`/`n` tick all/none, and `s` saves
+`picks.json` into the run directory. `apply --include-review` then writes
+only the ticked items (hard-fail items are shown locked and are never
+written). Real `apply` and `revert` ask for a `y` before they run; both
+dry-runs do not. Without a `picks.json`, `--include-review` behaves as
+before and writes every non-hard-fail review item.
+
+The extract row runs the model step for you when the `claude` command is
+on your PATH: it starts `claude -p` in the run directory, limited to
+reading files there and writing `extractions.json` (no shell, no other
+writes, nothing outside the run directory), and shows a condensed line
+per action in the output pane. Without `claude` on PATH the row shows the
+manual hint instead.
+
+When new reports land, the two `wave` rows at the bottom of the step list
+(or the keys `1` and `2`) take every linker as far as review.
+`1` starts Wave 1: `report-location`, `report-sector`, `report-actor` and
+`report-vuln`, one new run each, in that order, each through select →
+fetch → batch → structured → extract → validate (minus the steps a
+linker skips). `2` starts Wave 2: `report-labels`, then `actor-target
+--source report` limited to the reports the latest Wave 1 selected.
+Press `2` only after Wave 1 has been reviewed and applied, since both
+read objects Wave 1 writes; it refuses to start if there is no Wave 1
+run. Wave runs are named `<UTC timestamp>-w<n>-<linker>`. A linker that
+selects nothing, or whose step fails, stops there and the wave moves on.
+Without `claude` on PATH the model linkers stop before extract ("needs
+extract: claude not on PATH"), and an extract that exits without writing
+or updating `extractions.json` counts as failed (`structured` already
+writes the file, so its mere presence is not enough). The wave ends with one summary line
+per run. Nothing in a wave writes to the platform: apply each run yourself after review. `x` cancels a
+running wave, and only one job runs at a time (a wave will not start
+while a step runs, and Enter on a step is refused while a wave runs).
 
 `bin/octi-rb status` lists every run directory with its counts at each
 stage. Every pipeline command (`select`, `fetch`, `structured`, `batch`,

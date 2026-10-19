@@ -36,6 +36,13 @@ Everything with `hard_fail: false` is a judgement call the tool declined to
 make automatically — usually because `confidence` is `medium`/`low`, or the
 match came from the crosswalk. These are the ones worth reading carefully.
 
+## Accepting only some items
+
+`${CLAUDE_PLUGIN_ROOT}/bin/octi-rb tui` → `v` opens `review.json` as a
+checkbox list; `s` writes `picks.json` into the run directory. When that
+file exists, `apply --include-review` writes only the ticked items (never
+a `hard_fail` one). Without it, the rule below applies unchanged.
+
 ## Dropping an item
 
 `--include-review` writes **every** non-`hard_fail` item in `review.json`,
